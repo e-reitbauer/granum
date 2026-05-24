@@ -14,6 +14,7 @@ import threading
 import typer
 import typer.rich_utils as _ru
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn  # Progress/SpinnerColumn used by timeline
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
@@ -23,11 +24,11 @@ from rich import box
 _ru.STYLE_COMMANDS_TABLE_FIRST_COLUMN = "#fe9785"   # light coral — command names (palette accent)
 _ru.STYLE_OPTION = "#f27059"                        # coral — long flags
 _ru.STYLE_SWITCH = "#f27059"
-_ru.STYLE_NEGATIVE_OPTION = "#4a6d7c"               # teal — negative flags
-_ru.STYLE_NEGATIVE_SWITCH = "#4a6d7c"
-_ru.STYLE_METAVAR = "#4a6d7c"                       # teal — type hints
-_ru.STYLE_OPTION_DEFAULT = "#4a6d7c"
-_ru.STYLE_OPTION_ENVVAR = "#4a6d7c"
+_ru.STYLE_NEGATIVE_OPTION = "#7aaabb"               # light teal — negative flags
+_ru.STYLE_NEGATIVE_SWITCH = "#7aaabb"
+_ru.STYLE_METAVAR = "#7aaabb"                       # light teal — type hints
+_ru.STYLE_OPTION_DEFAULT = "#7aaabb"
+_ru.STYLE_OPTION_ENVVAR = "#7aaabb"
 _ru.STYLE_OPTIONS_PANEL_BORDER = "#4a6d7c"          # teal border
 _ru.STYLE_COMMANDS_PANEL_BORDER = "#4a6d7c"
 
@@ -49,9 +50,9 @@ ORANGE = "#f27059"   # coral
 GREEN = "#22c55e"   # green — success
 AMBER = "#f59e0b"   # amber — warnings
 RED = "#ef4444"     # red — errors
-GRAY = "#4a6d7c"    # teal
+GRAY = "#4a6d7c"    # teal — deprecated/de-emphasized
 BODY = "#c6d8d3"    # sage
-MUTED = "#4a6d7c"   # teal
+MUTED = "#8ab4c2"   # light teal — secondary text
 
 TYPE_ICONS = {
     "decision": "◆",
@@ -59,6 +60,13 @@ TYPE_ICONS = {
     "preference": "★",
     "file_state": "▪",
     "spec": "◇",
+}
+TYPE_COLORS = {
+    "decision":   ORANGE,    # coral
+    "constraint": AMBER,     # amber
+    "preference": "#fe9785", # light coral
+    "file_state": MUTED,     # light teal
+    "spec":       GRAY,      # teal
 }
 STATUS_ICONS = {"active": "✓", "deprecated": "○", "deleted": "×"}
 
@@ -200,7 +208,37 @@ def _stale_style(age_days: int, stale_threshold: int) -> Optional[str]:
     return None
 
 
-def _add_chunk_row(table: Table, chunk, stale_threshold: int) -> None:
+_COL_DEFS: dict[str, dict] = {
+    "id":     {"header": "ID",     "style": MUTED, "width": 9},
+    "type":   {"header": "Type",   "width": 16},
+    "title":  {"header": "Title",  "min_width": 24, "max_width": 52, "no_wrap": True, "overflow": "ellipsis"},
+    "age":    {"header": "Age",    "width": 14},
+    "imp":    {"header": "Imp",    "width": 4},
+    "status": {"header": "Status", "width": 14},
+    "score":  {"header": "Score",  "width": 7},
+    "sim":    {"header": "Sim",    "width": 7},
+}
+
+_DEFAULT_COLS = ["id", "type", "title", "age", "imp", "status"]
+
+
+def _make_chunk_table(cols: list[str] | None = None) -> Table:
+    table = Table(
+        box=box.SIMPLE_HEAD, show_header=True, header_style=f"bold {ORANGE}",
+        border_style=GRAY, padding=(0, 1), show_edge=False,
+    )
+    for col in (cols or _DEFAULT_COLS):
+        defn = _COL_DEFS[col]
+        table.add_column(defn["header"], **{k: v for k, v in defn.items() if k != "header"})
+    return table
+
+
+def _table_panel(table: Table, title: str) -> Panel:
+    return Panel(table, title=f"[dim {MUTED}]{title}[/dim {MUTED}]", border_style=GRAY, padding=(0, 1), title_align="left", expand=False)
+
+
+def _add_chunk_row(table: Table, chunk, stale_threshold: int, cols: list[str] | None = None) -> None:
+    cols = cols or _DEFAULT_COLS
     icon = TYPE_ICONS.get(chunk.type, "·")
     secs = _age_seconds(chunk.updated_at)
     age_days = _age_days_from_seconds(secs)
@@ -208,45 +246,46 @@ def _add_chunk_row(table: Table, chunk, stale_threshold: int) -> None:
 
     age_label = _age_str(secs)
     if stale_color:
-        badge = " ⚠ STALE" if age_days <= 14 else " ⚠ VERY STALE"
+        badge = " ⚠" if age_days <= 14 else " ⚠⚠"
         age_cell = f"[{stale_color}]{age_label}{badge}[/{stale_color}]"
     else:
         age_cell = f"[{MUTED}]{age_label}[/{MUTED}]"
 
-    if chunk.status == "deprecated":
-        row_style = f"dim {GRAY}"
-        status_cell = f"[{GRAY}]○ deprecated[/{GRAY}]"
-        title_cell = f"[italic {GRAY}]{chunk.title}[/italic {GRAY}]"
-    else:
-        row_style = BODY
-        status_cell = f"[{GREEN}]✓[/{GREEN}]"
-        title_cell = f"[{BODY}]{chunk.title}[/{BODY}]"
-
-    table.add_row(
-        f"[{MUTED}]{chunk.id[:8]}[/{MUTED}]",
-        f"[{ORANGE}]{icon}[/{ORANGE}] [{MUTED}]{chunk.type}[/{MUTED}]",
-        title_cell,
-        age_cell,
-        f"[{ORANGE}]{chunk.importance}[/{ORANGE}]",
-        status_cell,
-    )
+    deprecated = chunk.status == "deprecated"
+    tc = TYPE_COLORS.get(chunk.type, MUTED)
+    cells = {
+        "id":     f"[{MUTED}]{chunk.id[:8]}[/{MUTED}]",
+        "type":   f"[{tc}]{icon} {chunk.type}[/{tc}]",
+        "title":  f"[italic {GRAY}]{chunk.title}[/italic {GRAY}]" if deprecated else f"[{BODY}]{chunk.title}[/{BODY}]",
+        "age":    age_cell,
+        "imp":    f"[{MUTED}]{chunk.importance}[/{MUTED}]",
+        "status": f"[{GRAY}]○[/{GRAY}]" if deprecated else f"[{GREEN}]✓[/{GREEN}]",
+    }
+    table.add_row(*[cells[c] for c in cols])
 
 
-def _make_chunk_table(title: str = "") -> Table:
-    table = Table(
-        box=box.SIMPLE,
-        show_header=True,
-        header_style=f"bold {ORANGE}",
-        title=title or None,
-        title_style=f"bold {ORANGE}",
-    )
-    table.add_column("ID", style=MUTED, width=9)
-    table.add_column("Type", style=BODY, width=18)
-    table.add_column("Title", style=BODY, min_width=30)
-    table.add_column("Age", width=14)
-    table.add_column("Imp", width=4)
-    table.add_column("Status", width=14)
-    return table
+def _context_panel(memory_count: int = 0, spec_count: int = 0) -> Panel:
+    from rich.text import Text
+    proj = Path(_git_root() or ".").name
+    branch = _git_branch()
+    t = Text()
+    t.append(proj, style=f"bold {ORANGE}")
+    t.append(f"  {branch}", style=f"dim {MUTED}")
+    parts = []
+    if memory_count:
+        parts.append(f"{memory_count} chunk{'s' if memory_count != 1 else ''}")
+    if spec_count:
+        parts.append(f"{spec_count} spec{'s' if spec_count != 1 else ''}")
+    if parts:
+        t.append(f"\n{'  ·  '.join(parts)}", style=f"dim {MUTED}")
+    return Panel(t, border_style=GRAY, padding=(0, 1), expand=False)
+
+
+def _kv_table() -> Table:
+    t = Table(box=None, show_header=False, padding=(0, 3, 0, 0), show_edge=False)
+    t.add_column("key", style=MUTED, width=14, no_wrap=True)
+    t.add_column("value")
+    return t
 
 
 # ------------------------------------------------------------------
@@ -417,20 +456,19 @@ def list_cmd(
         console.print(f"[{MUTED}]· No chunks found[/{MUTED}]")
         return
 
+    console.print(_context_panel(len(chunks), len(spec_chunks)))
+
     if chunks:
         table = _make_chunk_table()
         for chunk in chunks:
             _add_chunk_row(table, chunk, stale_threshold)
-        console.print(table)
-        console.print(f"[{MUTED}]{len(chunks)} memory chunk(s)[/{MUTED}]")
+        console.print(_table_panel(table, f"memory  {len(chunks)}"))
 
     if spec_chunks:
-        spec_table = _make_chunk_table("Spec chunks (read-only, re-indexed each session)")
+        spec_table = _make_chunk_table()
         for chunk in spec_chunks:
             _add_chunk_row(spec_table, chunk, stale_threshold)
-
-        console.print(spec_table)
-        console.print(f"[{MUTED}]{len(spec_chunks)} spec chunk(s)[/{MUTED}]")
+        console.print(_table_panel(spec_table, f"specs  {len(spec_chunks)}"))
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
@@ -455,35 +493,20 @@ def recent(
         console.print(f"[{MUTED}]· No chunks found[/{MUTED}]")
         return
 
-    def _recent_table() -> Table:
-        t = Table(box=box.SIMPLE, show_header=True, header_style=f"bold {ORANGE}")
-        t.add_column("Type", width=18)
-        t.add_column("Title", min_width=30)
-        t.add_column("Updated", width=16)
-        return t
-
-    if chunks:
-        table = _recent_table()
-        for chunk in chunks:
-            icon = TYPE_ICONS.get(chunk.type, "·")
-            secs = _age_seconds(chunk.updated_at)
-            table.add_row(
-                f"[{ORANGE}]{icon}[/{ORANGE}] [{MUTED}]{chunk.type}[/{MUTED}]",
-                f"[{BODY}]{chunk.title}[/{BODY}]",
-                f"[{MUTED}]{_age_str(secs)}[/{MUTED}]",
-            )
-        console.print(table)
-
-    if spec_chunks:
-        spec_table = _recent_table()
-        for chunk in spec_chunks:
-            spec_table.add_row(
-                f"[{ORANGE}]◇[/{ORANGE}] [{MUTED}]spec[/{MUTED}]",
-                f"[{BODY}]{chunk.title}[/{BODY}]",
-                f"[{MUTED}]{chunk.source or ''}[/{MUTED}]",
-            )
-        console.print(spec_table)
-        console.print(f"[{MUTED}]{len(spec_chunks)} spec chunk(s) — re-indexed each session[/{MUTED}]")
+    RECENT_COLS = ["id", "type", "title", "age"]
+    stale_threshold = config.get("stale_threshold_days", 7)
+    table = _make_chunk_table(RECENT_COLS)
+    for chunk in chunks:
+        _add_chunk_row(table, chunk, stale_threshold, RECENT_COLS)
+    for chunk in spec_chunks:
+        tc = TYPE_COLORS["spec"]
+        table.add_row(
+            f"[{MUTED}]{chunk.id[:8]}[/{MUTED}]",
+            f"[{tc}]◇ spec[/{tc}]",
+            f"[{BODY}]{chunk.title}[/{BODY}]",
+            f"[dim {MUTED}]re-indexed[/dim {MUTED}]",
+        )
+    console.print(_table_panel(table, f"recent  {len(chunks)} chunk(s)  ·  {len(spec_chunks)} spec(s)"))
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
@@ -504,25 +527,11 @@ def stale(project: Optional[str] = typer.Option(None, "--project")):
         console.print(f"[{GREEN}]✓ No stale chunks[/{GREEN}]")
         return
 
-    table = Table(box=box.SIMPLE, show_header=True, header_style=f"bold {ORANGE}")
-    table.add_column("Type", width=18)
-    table.add_column("Title", min_width=30)
-    table.add_column("Age", width=10)
-    table.add_column("Imp", width=4)
-
+    STALE_COLS = ["id", "type", "title", "age", "imp"]
+    table = _make_chunk_table(STALE_COLS)
     for chunk in stale_chunks:
-        icon = TYPE_ICONS.get(chunk.type, "·")
-        age_days = _age_days_from_seconds(_age_seconds(chunk.updated_at))
-        color = RED if age_days > 14 else AMBER
-        table.add_row(
-            f"[{ORANGE}]{icon}[/{ORANGE}] [{MUTED}]{chunk.type}[/{MUTED}]",
-            f"[{BODY}]{chunk.title}[/{BODY}]",
-            f"[{color}]{age_days}d[/{color}]",
-            f"[{ORANGE}]{chunk.importance}[/{ORANGE}]",
-        )
-
-    console.print(table)
-    console.print(f"[{AMBER}]⚠ {len(stale_chunks)} stale chunk(s)[/{AMBER}]")
+        _add_chunk_row(table, chunk, threshold, STALE_COLS)
+    console.print(_table_panel(table, f"stale  {len(stale_chunks)}  >{threshold}d"))
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
@@ -554,25 +563,19 @@ def search(
         console.print(f"[{MUTED}]· No results[/{MUTED}]")
         return
 
-    table = Table(box=box.SIMPLE, show_header=True, header_style=f"bold {ORANGE}")
-    table.add_column("Type", width=18)
-    table.add_column("Title", min_width=28)
-    table.add_column("Score", width=7)
-    table.add_column("Sim", width=7)
-    table.add_column("Age", width=10)
-
+    table = _make_chunk_table(["type", "title", "score", "sim", "age"])
     for r in results:
         icon = TYPE_ICONS.get(r["type"], "·")
-        stale = f" [{AMBER}]⚠[/{AMBER}]" if r.get("stale_warning") else ""
+        tc = TYPE_COLORS.get(r["type"], MUTED)
+        stale_badge = f" [{AMBER}]⚠[/{AMBER}]" if r.get("stale_warning") else ""
         table.add_row(
-            f"[{ORANGE}]{icon}[/{ORANGE}] [{MUTED}]{r['type']}[/{MUTED}]",
-            f"[{BODY}]{r['title']}[/{BODY}]{stale}",
+            f"[{tc}]{icon} {r['type']}[/{tc}]",
+            f"[{BODY}]{r['title']}[/{BODY}]{stale_badge}",
             f"[{ORANGE}]{r['final_score']:.2f}[/{ORANGE}]",
             f"[{MUTED}]{r['similarity']:.2f}[/{MUTED}]",
-            f"[{MUTED}]{r['age']}[/{MUTED}]",
+            f"[dim {MUTED}]{r['age']}[/dim {MUTED}]",
         )
-
-    console.print(table)
+    console.print(_table_panel(table, f"results  {len(results)}"))
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
@@ -601,7 +604,22 @@ def delete(chunk_id: str = typer.Argument(...)):
     if ok:
         console.print(f"[{GREEN}]✓[/{GREEN}] Deleted [{MUTED}]{chunk_id[:12]}[/{MUTED}]")
     else:
-        console.print(f"[{RED}]✗ Chunk not found: {chunk_id}[/{RED}]")
+        # Check if already tombstoned in ndjson
+        ndjson = granum_dir / "chunks.ndjson"
+        already_gone = False
+        if ndjson.exists():
+            for line in ndjson.read_text().splitlines():
+                try:
+                    d = json.loads(line)
+                    if d.get("id", "").startswith(chunk_id) and d.get("deleted_at"):
+                        already_gone = True
+                        break
+                except Exception:
+                    pass
+        if already_gone:
+            console.print(f"[{MUTED}]· Already deleted: {chunk_id[:12]}[/{MUTED}]")
+        else:
+            console.print(f"[{RED}]✗ Chunk not found: {chunk_id}[/{RED}]")
 
 
 @app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
@@ -623,16 +641,17 @@ def stats(project: Optional[str] = typer.Option(None, "--project")):
     stale = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
 
     db_size = _dir_size(granum_dir / "db")
-
-    console.print(f"\n[{ORANGE}]─ Granum Stats ─────────────────────────[/{ORANGE}]")
-    console.print(f"[{MUTED}]Project:[/{MUTED}]   [{BODY}]{_git_root() or Path.cwd()} (branch: {_git_branch()})[/{BODY}]")
-    console.print(f"[{MUTED}]Spec paths:[/{MUTED}] [{BODY}]{', '.join(config.get('spec_paths', [])) or 'none'}[/{BODY}]")
-    console.print(f"[{MUTED}]Memory:[/{MUTED}]    [{GREEN}]{len(active)} active[/{GREEN}], [{GRAY}]{len(deprecated)} deprecated[/{GRAY}]")
-    console.print(f"[{MUTED}]Specs:[/{MUTED}]     [{BODY}]{len(spec_chunks)} chunk(s) indexed[/{BODY}]")
-    console.print(f"[{MUTED}]Stale:[/{MUTED}]     [{AMBER}]{len(stale)}[/{AMBER}]")
-    console.print(f"[{MUTED}]DB size:[/{MUTED}]   [{BODY}]{db_size}[/{BODY}]")
-    console.print(f"[{MUTED}]Embedding:[/{MUTED}] [{BODY}]{config.get('embedding_model', 'all-MiniLM-L6-v2')}[/{BODY}]")
-    console.print()
+    proj = Path(_git_root() or ".").name
+    branch = _git_branch()
+    t = _kv_table()
+    t.add_row("project",    f"[{BODY}]{proj}[/{BODY}] [dim {MUTED}]{branch}[/dim {MUTED}]")
+    t.add_row("spec paths", f"[{BODY}]{', '.join(config.get('spec_paths', [])) or 'none'}[/{BODY}]")
+    t.add_row("memory",     f"[{GREEN}]{len(active)} active[/{GREEN}]  [dim {GRAY}]{len(deprecated)} deprecated[/dim {GRAY}]")
+    t.add_row("specs",      f"[{BODY}]{len(spec_chunks)} indexed[/{BODY}]")
+    t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("db size",    f"[{BODY}]{db_size}[/{BODY}]")
+    t.add_row("embedding",  f"[dim {MUTED}]{config.get('embedding_model', 'all-MiniLM-L6-v2')}[/dim {MUTED}]")
+    console.print(Panel(t, title=f"[bold {ORANGE}]stats[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
 
 
 @app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
@@ -655,27 +674,31 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
     very_stale = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > 30]
     low_value = [c for c in active if c.importance <= 2 and _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
 
-    console.print(f"\n[{ORANGE}]─ Granum Audit ─────────────────────────[/{ORANGE}]")
-    console.print(f"[{MUTED}]Project:[/{MUTED}]      [{BODY}]{_git_root() or Path.cwd()} (branch: {_git_branch()})[/{BODY}]")
-    console.print(f"Active:       [{GREEN}]{len(active)} chunks[/{GREEN}]")
-    console.print(f"Specs:        [{BODY}]{len(spec_chunks)} chunk(s) indexed[/{BODY}]")
-    console.print(f"Deprecated:   [{GRAY}]{len(deprecated)} chunks[/{GRAY}]")
-    console.print(f"Stale:        [{AMBER}]{len(stale)} chunks[/{AMBER}]  (>{threshold}d)")
-    console.print(f"Very stale:   [{RED}]{len(very_stale)} chunk(s)[/{RED}]  (>30d)")
-    console.print(f"Low value:    [{MUTED}]{len(low_value)} chunk(s)[/{MUTED}]  (importance 1-2, stale)")
-
-    # Possible duplicates (same type, similar title prefix)
     duplicates = _find_possible_duplicates(active)
+
+    proj = Path(_git_root() or ".").name
+    branch = _git_branch()
+    t = _kv_table()
+    t.add_row("project",    f"[{BODY}]{proj}[/{BODY}] [dim {MUTED}]{branch}[/dim {MUTED}]")
+    t.add_row("active",     f"[{GREEN}]{len(active)}[/{GREEN}]")
+    t.add_row("specs",      f"[{BODY}]{len(spec_chunks)}[/{BODY}]")
+    t.add_row("deprecated", f"[dim {GRAY}]{len(deprecated)}[/dim {GRAY}]")
+    t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}] [dim {MUTED}](>{threshold}d)[/dim {MUTED}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("very stale", f"[{RED}]{len(very_stale)}[/{RED}] [dim {MUTED}](>30d)[/dim {MUTED}]" if very_stale else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("low value",  f"[{AMBER}]{len(low_value)}[/{AMBER}] [dim {MUTED}](imp ≤2, stale)[/dim {MUTED}]" if low_value else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("duplicates", f"[{AMBER}]{len(duplicates)} pair(s)[/{AMBER}]" if duplicates else f"[dim {MUTED}]0[/dim {MUTED}]")
+    console.print(Panel(t, title=f"[bold {ORANGE}]audit[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
+
     if duplicates:
-        console.print(f"\n[{AMBER}]Possible duplicates (similar titles, same type):[/{AMBER}]")
+        dup_table = _make_chunk_table(["id", "type", "title"])
         for a, b in duplicates:
-            console.print(f"  [{MUTED}]{a.id[:4]}[/{MUTED}]  [{BODY}]\"{a.title}\"[/{BODY}]")
-            console.print(f"  [{MUTED}]{b.id[:4]}[/{MUTED}]  [{BODY}]\"{b.title}\"[/{BODY}]  [{MUTED}]— consider merging[/{MUTED}]")
+            _add_chunk_row(dup_table, a, threshold, ["id", "type", "title"])
+            _add_chunk_row(dup_table, b, threshold, ["id", "type", "title"])
+            dup_table.add_row("", "", "")
+        console.print(_table_panel(dup_table, f"possible duplicates  {len(duplicates)} pair(s)"))
 
     if low_value:
-        console.print(f"\n[{MUTED}]Recommendation: run cleanup_context on {len(low_value)} low-value stale chunk(s).[/{MUTED}]")
-
-    console.print()
+        console.print(f"[{MUTED}]→ run cleanup_context on {len(low_value)} low-value chunk(s)[/{MUTED}]")
 
 
 @app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
@@ -693,11 +716,13 @@ def timeline(
 
     with _spinner("Querying memory store") as status:
         all_chunks = _get_chunks(granum_dir, project_id, config, include_deprecated=True, _status=status)
+        status.update("Querying spec store")
+        spec_chunks = _get_spec_chunks(granum_dir, project_id, config)
         status.update("Mapping activity to calendar")
 
-    # Count saves per day
+    # Count saves per day (memory + specs)
     day_counts: dict[str, int] = {}
-    for chunk in all_chunks:
+    for chunk in all_chunks + spec_chunks:
         try:
             day_counts[chunk.updated_at[:10]] = day_counts.get(chunk.updated_at[:10], 0) + 1
         except Exception:
@@ -708,21 +733,20 @@ def timeline(
 
     def _cell(d: Optional[date]) -> str:
         if d is None:
-            return "  "
+            return "   "
         count = day_counts.get(str(d), 0)
         if count == 0:
-            return f"[{MUTED}]░░[/{MUTED}]"
+            return f"[{GRAY}]·[/{GRAY}]  "
         intensity = count / max_count
         if intensity < 0.33:
-            return f"[{MUTED}]▒▒[/{MUTED}]"
+            return f"[{BODY}]▪[/{BODY}]  "
         elif intensity < 0.66:
-            return f"[{AMBER}]▓▓[/{AMBER}]"
+            return f"[{AMBER}]▪[/{AMBER}]  "
         else:
-            return f"[{ORANGE}]██[/{ORANGE}]"
+            return f"[bold {ORANGE}]▪[/bold {ORANGE}]  "
 
-    console.print(f"\n  [{ORANGE}]Granum activity — {Path(_git_root() or '.').name} ({_git_branch()})[/{ORANGE}]")
+    console.print(_context_panel(len(all_chunks), len(spec_chunks)))
 
-    # Render each month
     for m_offset in range(months - 1, -1, -1):
         year = today.year
         month = today.month - m_offset
@@ -734,27 +758,22 @@ def timeline(
         _, days_in_month = calendar.monthrange(year, month)
         first_dow = date(year, month, 1).weekday()  # 0=Mon
 
-        console.print(f"\n  [{ORANGE}]{month_name}[/{ORANGE}]")
-        console.print(f"  [{MUTED}]Mo Tu We Th Fr Sa Su[/{MUTED}]")
+        console.print(f"\n  [{MUTED}]{month_name}[/{MUTED}]")
+        console.print(f"  [{MUTED}]Mo  Tu  We  Th  Fr  Sa  Su[/{MUTED}]")
 
-        # Build weeks
         cells: list[Optional[date]] = [None] * first_dow
         for day in range(1, days_in_month + 1):
             cells.append(date(year, month, day))
-        # Pad to full weeks
         while len(cells) % 7 != 0:
             cells.append(None)
 
         for week_start in range(0, len(cells), 7):
             week = cells[week_start:week_start + 7]
-            row = "  "
-            for d in week:
-                row += _cell(d) + " "
-            console.print(row)
+            console.print("  " + "".join(_cell(d) for d in week))
 
     total_saves = sum(day_counts.values())
     active_days = len(day_counts)
-    console.print(f"\n  [{MUTED}]░ none  ▒ light  ▓ medium  █ heavy    {total_saves} save(s) across {active_days} active day(s)[/{MUTED}]\n")
+    console.print(f"\n  [{MUTED}]· none  [{BODY}]▪[/{BODY}] light  [{AMBER}]▪[/{AMBER}] medium  [{ORANGE}]▪[/{ORANGE}] heavy    {total_saves} event(s) across {active_days} day(s)  ·  {len(all_chunks)} memory  {len(spec_chunks)} specs[/{MUTED}]\n")
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
@@ -834,10 +853,27 @@ def specs_list():
     if not paths:
         console.print(f"[{MUTED}]· No spec paths configured[/{MUTED}]")
         return
+
+    t = Table(box=box.SIMPLE_HEAD, show_header=True, header_style=f"bold {ORANGE}", border_style=GRAY)
+    t.add_column("Path", min_width=30)
+    t.add_column("Status", width=10)
+    t.add_column("Files", width=6)
     for p in paths:
-        exists = (Path.cwd() / p).exists()
-        icon = f"[{GREEN}]✓[/{GREEN}]" if exists else f"[{AMBER}]⚠[/{AMBER}]"
-        console.print(f"  {icon} [{BODY}]{p}[/{BODY}]")
+        full = Path.cwd() / p
+        exists = full.exists()
+        if not exists:
+            status = f"[{AMBER}]⚠ missing[/{AMBER}]"
+            file_count = f"[dim {MUTED}]—[/dim {MUTED}]"
+        else:
+            status = f"[{GREEN}]✓ ok[/{GREEN}]"
+            if full.is_dir():
+                n = len(list(full.rglob("*.md")))
+                file_count = f"[{MUTED}]{n}[/{MUTED}]"
+            else:
+                file_count = f"[{MUTED}]1[/{MUTED}]"
+        t.add_row(f"[{BODY}]{p}[/{BODY}]", status, file_count)
+    console.print(t)
+    console.print(f"[dim {MUTED}]{len(paths)} path(s)[/dim {MUTED}]")
 
 
 @specs_app.command("add")

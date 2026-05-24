@@ -132,6 +132,7 @@ class GranumDB:
         return count
 
     def export_ndjson(self, project_id: str) -> None:
+        # Load existing ndjson to preserve tombstones from other projects/branches
         existing: dict[str, dict] = {}
         if self.ndjson_path.exists():
             with self.ndjson_path.open() as f:
@@ -145,14 +146,17 @@ class GranumDB:
                     except Exception:
                         pass
 
-        # Fetch all memory chunks for project (spec chunks excluded)
+        # Fetch all live memory chunks for project from ChromaDB (spec chunks excluded)
         results = self._collection.get(
             where={"$and": [{"project_id": project_id}, {"type": {"$in": list(MEMORY_TYPES)}}]},
             include=["metadatas", "documents"],
         )
+        chroma_ids: set[str] = set(results["ids"])
+        output: dict[str, dict] = {}
+
         for i, chunk_id in enumerate(results["ids"]):
             meta = results["metadatas"][i]
-            d = {
+            output[chunk_id] = {
                 "id": chunk_id,
                 "project_id": meta["project_id"],
                 "title": meta["title"],
@@ -165,11 +169,23 @@ class GranumDB:
                 "updated_at": meta["updated_at"],
                 "deleted_at": meta.get("deleted_at"),
             }
-            existing[chunk_id] = d
+
+        # Any chunk previously in ndjson for this project that is no longer in ChromaDB
+        # was deleted — write it as a tombstone so import_ndjson removes it next startup.
+        now = datetime.now(timezone.utc).isoformat()
+        for chunk_id, d in existing.items():
+            if d.get("project_id") != project_id:
+                output.setdefault(chunk_id, d)  # preserve other projects unchanged
+            elif chunk_id not in chroma_ids and not d.get("deleted_at"):
+                tombstone = dict(d)
+                tombstone["deleted_at"] = now
+                output[chunk_id] = tombstone
+            elif chunk_id not in output:
+                output[chunk_id] = d  # already has deleted_at, keep as-is
 
         self.ndjson_path.parent.mkdir(parents=True, exist_ok=True)
         with self.ndjson_path.open("w") as f:
-            for d in existing.values():
+            for d in output.values():
                 f.write(json.dumps(d) + "\n")
 
     # ------------------------------------------------------------------
@@ -616,12 +632,28 @@ class GranumDB:
             self._upsert_to_chroma(chunk)
         return len(chunks)
 
+    def _expand_id(self, chunk_id: str) -> Optional[str]:
+        """Resolve a full or prefix chunk ID to the full ID."""
+        if len(chunk_id) == 64:
+            return chunk_id
+        try:
+            result = self._collection.get(include=[])
+            for full_id in result["ids"]:
+                if full_id.startswith(chunk_id):
+                    return full_id
+        except Exception:
+            pass
+        return None
+
     def soft_delete(self, chunk_id: str) -> bool:
-        chunk = self._get_by_id(chunk_id)
+        full_id = self._expand_id(chunk_id)
+        if not full_id:
+            return False
+        chunk = self._get_by_id(full_id)
         if not chunk:
             return False
         now = datetime.now(timezone.utc).isoformat()
         chunk.deleted_at = now
         self._upsert_to_chroma(chunk)
-        self._collection.delete(ids=[chunk_id])
+        self._collection.delete(ids=[full_id])
         return True
