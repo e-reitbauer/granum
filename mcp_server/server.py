@@ -72,7 +72,7 @@ project_id: str = config.get("project_id") or _make_project_id(
 )
 
 db = GranumDB(
-    db_path=granum_dir / "db",
+    db_path=granum_dir / "kuzu.db",
     ndjson_path=granum_dir / "chunks.ndjson",
     stale_threshold_days=config.get("stale_threshold_days", 7),
 )
@@ -134,7 +134,12 @@ _SERVER_INSTRUCTIONS = (
 
     "AUDIT: when the user reports a wrong answer, or when you act on a chunk naming a specific file/function/flag —\n"
     "  call list_chunks, verify stale entries, then cleanup_context to deprecate or merge.\n"
-    "After editing a spec file: call reindex_specs so changes are immediately searchable."
+    "After editing a spec file: call reindex_specs so changes are immediately searchable.\n\n"
+    "GRAPH EDGES — declare relationships explicitly with add_edge when you know:\n"
+    "  - A decision SUPERSEDES an older one (don't just overwrite — preserve history)\n"
+    "  - One chunk DEPENDS_ON another (understanding A requires B)\n"
+    "  - Two chunks CONTRADICT each other (mutually exclusive decisions)\n"
+    "  RELATES_TO is auto-detected. The others require your judgment."
 )
 
 app = Server("granum", instructions=_SERVER_INSTRUCTIONS)
@@ -155,6 +160,7 @@ async def _on_initialized(notification: InitializedNotification) -> None:
             config["embedding_version"] = _EMBEDDING_VERSION
             (granum_dir / "config.json").write_text(json.dumps(config, indent=2))
         _reindex_all_specs()
+        db.sync_spec_edges(project_id)
     except Exception as e:
         print(f"[granum] session init error: {e}", file=sys.stderr)
 
@@ -260,6 +266,42 @@ async def list_tools() -> list[Tool]:
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
+        Tool(
+            name="add_edge",
+            description=(
+                "Declare a relationship between two memory chunks. Use when you understand "
+                "a relationship that auto-detection can't infer: "
+                "SUPERSEDES (A replaces B), DEPENDS_ON (A only makes sense given B), "
+                "CONTRADICTS (A and B are mutually exclusive), DERIVED_FROM (A was merged from B)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "from_id":   {"type": "string", "description": "ID of the source chunk"},
+                    "to_id":     {"type": "string", "description": "ID of the target chunk"},
+                    "edge_type": {"type": "string", "enum": list(["CONTRADICTS", "SUPERSEDES", "RELATES_TO", "DERIVED_FROM", "DEPENDS_ON"])},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Confidence 0–1, default 1.0"},
+                },
+                "required": ["from_id", "to_id", "edge_type"],
+            },
+        ),
+        Tool(
+            name="get_related_chunks",
+            description=(
+                "Traverse the memory graph from a chunk. Returns neighbors with edge types "
+                "(CONTRADICTS, SUPERSEDES, RELATES_TO, DERIVED_FROM, DEPENDS_ON). "
+                "Use when you need the full context chain around a decision, or to audit conflicts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "chunk_id":  {"type": "string", "description": "ID of the chunk to start from"},
+                    "edge_type": {"type": "string", "enum": ["CONTRADICTS", "SUPERSEDES", "RELATES_TO", "DERIVED_FROM", "DEPENDS_ON"], "description": "Optional: filter to one edge type"},
+                    "depth":     {"type": "integer", "minimum": 1, "maximum": 2, "description": "Hop depth (default 1)"},
+                },
+                "required": ["chunk_id"],
+            },
+        ),
     ]
 
 
@@ -325,6 +367,24 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "reindex_specs":
             count = _reindex_all_specs()
             return [TextContent(type="text", text=json.dumps({"indexed": count}))]
+
+        elif name == "add_edge":
+            result = db.add_edge(
+                from_id=arguments["from_id"],
+                to_id=arguments["to_id"],
+                edge_type=arguments["edge_type"],
+                confidence=arguments.get("confidence", 1.0),
+            )
+            db.export_ndjson(project_id)
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        elif name == "get_related_chunks":
+            edges = db.get_edges(
+                chunk_id=arguments["chunk_id"],
+                edge_type=arguments.get("edge_type"),
+                depth=arguments.get("depth", 1),
+            )
+            return [TextContent(type="text", text=json.dumps(edges, indent=2))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
@@ -434,6 +494,14 @@ def _reindex_all_specs() -> int:
 # ------------------------------------------------------------------
 
 async def _ipc_handler(method: str, params: dict):
+    if method == "get_edges":
+        return db.get_edges(
+            params["chunk_id"],
+            edge_type=params.get("edge_type"),
+            depth=params.get("depth", 1),
+        )
+    if method == "get_all_edges":
+        return db.get_all_edges(params["project_id"])
     if method == "list_chunks":
         chunks = db.get_all_memory_chunks(
             params["project_id"],
@@ -445,6 +513,7 @@ async def _ipc_handler(method: str, params: dict):
         return [c.to_dict() for c in chunks]
     if method == "reindex_specs":
         count = _reindex_all_specs()
+        db.sync_spec_edges(project_id)
         return {"indexed": count}
     if method == "reindex_spec_file":
         file_path = params["file_path"]

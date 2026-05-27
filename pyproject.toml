@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "granum"
-version = "0.1.0"
-description = "Persistent semantic memory for Claude Code sessions"
+version = "0.2.0"
+description = "Persistent semantic memory with graph relationships for Claude Code"
 requires-python = ">=3.9"
 dependencies = [
-    "chromadb>=0.4.0",
+    "kuzu>=0.5.0",
     "sentence-transformers>=2.2.0",
     "mcp>=1.0.0",
     "typer>=0.12.0",

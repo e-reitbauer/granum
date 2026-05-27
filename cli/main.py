@@ -18,6 +18,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn  # Progress/SpinnerColumn used by timeline
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
+from rich.tree import Tree
 from rich import box
 
 
@@ -121,7 +122,7 @@ def _get_db(config: dict, granum_dir: Path):
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from mcp_server.db import GranumDB
     return GranumDB(
-        db_path=granum_dir / "db",
+        db_path=granum_dir / "kuzu.db",
         ndjson_path=granum_dir / "chunks.ndjson",
         stale_threshold_days=config.get("stale_threshold_days", 7),
     )
@@ -146,6 +147,14 @@ def _ipc_chunks(granum_dir: Path, project_id: str, include_deprecated: bool = Fa
         "project_id": project_id,
         "include_deprecated": include_deprecated,
     })
+
+
+def _ipc_edges(granum_dir: Path, chunk_id: str, edge_type: Optional[str] = None, depth: int = 1) -> Optional[list]:
+    return _ipc_call(granum_dir, "get_edges", {"chunk_id": chunk_id, "edge_type": edge_type, "depth": depth})
+
+
+def _ipc_all_edges(granum_dir: Path, project_id: str) -> Optional[list]:
+    return _ipc_call(granum_dir, "get_all_edges", {"project_id": project_id})
 
 
 def _ipc_spec_chunks(granum_dir: Path, project_id: str) -> Optional[list]:
@@ -380,7 +389,7 @@ def init(reset: bool = typer.Option(False, "--reset", help="Re-run spec detectio
 
     # Write .granum/.gitignore
     gitignore = granum_dir / ".gitignore"
-    gitignore.write_text("session.log\ntool_call_count\n")
+    gitignore.write_text("session.log\ntool_call_count\nkuzu.db\n")
 
     # Wire MCP server into .mcp.json
     _write_mcp_json(cwd)
@@ -640,7 +649,7 @@ def stats(project: Optional[str] = typer.Option(None, "--project")):
     deprecated = [c for c in all_chunks if c.status == "deprecated"]
     stale = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
 
-    db_size = _dir_size(granum_dir / "db")
+    db_size = _dir_size(granum_dir / "kuzu.db")
     proj = Path(_git_root() or ".").name
     branch = _git_branch()
     t = _kv_table()
@@ -666,15 +675,31 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
         all_chunks = _get_chunks(granum_dir, project_id, config, include_deprecated=True, _status=status)
         status.update("Querying spec store")
         spec_chunks = _get_spec_chunks(granum_dir, project_id, config)
-        status.update("Checking for stale chunks")
+        status.update("Loading graph edges")
+        all_edges = _ipc_all_edges(granum_dir, project_id)
+        if all_edges is None:
+            db = _get_db(config, granum_dir)
+            db.import_ndjson()
+            all_edges = db.get_all_edges(project_id)
+        status.update("Analysing")
         active = [c for c in all_chunks if c.status == "active"]
 
-    deprecated = [c for c in all_chunks if c.status == "deprecated"]
-    stale = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
-    very_stale = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > 30]
-    low_value = [c for c in active if c.importance <= 2 and _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
+    deprecated  = [c for c in all_chunks if c.status == "deprecated"]
+    stale       = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
+    very_stale  = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > 30]
+    low_value   = [c for c in active if c.importance <= 2 and _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
+    conflicts   = [(e["from_id"], e["from_title"], e["to_id"], e["to_title"], e.get("confidence", 1.0))
+                   for e in (all_edges or []) if e["edge_type"] == "CONTRADICTS"]
+    # Deduplicate bidirectional pairs
+    seen_pairs: set[frozenset] = set()
+    unique_conflicts = []
+    for c in conflicts:
+        key = frozenset([c[0], c[2]])
+        if key not in seen_pairs:
+            seen_pairs.add(key)
+            unique_conflicts.append(c)
 
-    duplicates = _find_possible_duplicates(active)
+    orphans = _find_orphans(active, all_edges or [])
 
     proj = Path(_git_root() or ".").name
     branch = _git_branch()
@@ -682,20 +707,25 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
     t.add_row("project",    f"[{BODY}]{proj}[/{BODY}] [dim {MUTED}]{branch}[/dim {MUTED}]")
     t.add_row("active",     f"[{GREEN}]{len(active)}[/{GREEN}]")
     t.add_row("specs",      f"[{BODY}]{len(spec_chunks)}[/{BODY}]")
+    t.add_row("edges",      f"[{BODY}]{len(all_edges or [])}[/{BODY}]")
     t.add_row("deprecated", f"[dim {GRAY}]{len(deprecated)}[/dim {GRAY}]")
     t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}] [dim {MUTED}](>{threshold}d)[/dim {MUTED}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
     t.add_row("very stale", f"[{RED}]{len(very_stale)}[/{RED}] [dim {MUTED}](>30d)[/dim {MUTED}]" if very_stale else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("conflicts",  f"[{RED}]{len(unique_conflicts)} pair(s)[/{RED}]" if unique_conflicts else f"[dim {MUTED}]0[/dim {MUTED}]")
     t.add_row("low value",  f"[{AMBER}]{len(low_value)}[/{AMBER}] [dim {MUTED}](imp ≤2, stale)[/dim {MUTED}]" if low_value else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("duplicates", f"[{AMBER}]{len(duplicates)} pair(s)[/{AMBER}]" if duplicates else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("orphans",    f"[{MUTED}]{len(orphans)}[/{MUTED}] [dim {MUTED}](no edges)[/dim {MUTED}]" if orphans else f"[dim {MUTED}]0[/dim {MUTED}]")
     console.print(Panel(t, title=f"[bold {ORANGE}]audit[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
 
-    if duplicates:
-        dup_table = _make_chunk_table(["id", "type", "title"])
-        for a, b in duplicates:
-            _add_chunk_row(dup_table, a, threshold, ["id", "type", "title"])
-            _add_chunk_row(dup_table, b, threshold, ["id", "type", "title"])
-            dup_table.add_row("", "", "")
-        console.print(_table_panel(dup_table, f"possible duplicates  {len(duplicates)} pair(s)"))
+    if unique_conflicts:
+        console.print(f"  [{RED}]CONTRADICTING pairs — resolve with cleanup_context merge or deprecate:[/{RED}]")
+        for from_id, from_title, to_id, to_title, conf in unique_conflicts:
+            console.print(
+                f"    [{MUTED}]{from_id[:8]}[/{MUTED}] [{ORANGE}]{from_title[:40]}[/{ORANGE}]"
+                f"  [{RED}]⟷[/{RED}]  "
+                f"[{MUTED}]{to_id[:8]}[/{MUTED}] [{ORANGE}]{to_title[:40]}[/{ORANGE}]"
+                f"  [{MUTED}]sim {conf:.2f}[/{MUTED}]"
+            )
+        console.print()
 
     if low_value:
         console.print(f"[{MUTED}]→ run cleanup_context on {len(low_value)} low-value chunk(s)[/{MUTED}]")
@@ -774,6 +804,360 @@ def timeline(
     total_saves = sum(day_counts.values())
     active_days = len(day_counts)
     console.print(f"\n  [{MUTED}]· none  [{BODY}]▪[/{BODY}] light  [{AMBER}]▪[/{AMBER}] medium  [{ORANGE}]▪[/{ORANGE}] heavy    {total_saves} event(s) across {active_days} day(s)  ·  {len(all_chunks)} memory  {len(spec_chunks)} specs[/{MUTED}]\n")
+
+
+def _build_graph_html(chunks, edges: list[dict], git_root: Optional[str], branch: str) -> str:
+    import json as _json
+
+    proj = Path(git_root or ".").name
+    type_colors = {
+        "decision":   "#f27059",
+        "constraint": "#f59e0b",
+        "preference": "#fe9785",
+        "file_state": "#8ab4c2",
+        "spec":       "#4a6d7c",
+    }
+    edge_colors = {
+        "CONTRADICTS":  "#ef4444",
+        "SUPERSEDES":   "#f59e0b",
+        "RELATES_TO":   "#6b7280",
+        "DERIVED_FROM": "#22c55e",
+        "DEPENDS_ON":   "#f27059",
+    }
+    edge_dash = {"CONTRADICTS": "6,3", "SUPERSEDES": "4,2"}
+
+    nodes = [
+        {
+            "id":         c.id,
+            "label":      c.title[:40] + ("…" if len(c.title) > 40 else ""),
+            "fullTitle":  c.title,
+            "type":       c.type,
+            "importance": c.importance,
+            "status":     c.status,
+            "color":      type_colors.get(c.type, "#6b7280"),
+        }
+        for c in chunks
+    ]
+    node_ids = {c.id for c in chunks}
+    links = [
+        {
+            "source": e["from_id"],
+            "target": e["to_id"],
+            "type":   e["edge_type"],
+            "conf":   round(e.get("confidence") or 1.0, 2),
+            "color":  edge_colors.get(e["edge_type"], "#6b7280"),
+            "dash":   edge_dash.get(e["edge_type"], "0"),
+        }
+        for e in edges
+        if e["from_id"] in node_ids and e["to_id"] in node_ids
+    ]
+
+    data_json = _json.dumps({"nodes": nodes, "links": links})
+    legend_items = _json.dumps([
+        {"label": k, "color": v} for k, v in type_colors.items()
+    ])
+    edge_legend = _json.dumps([
+        {"label": k, "color": v, "dash": edge_dash.get(k, "0")} for k, v in edge_colors.items()
+    ])
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Granum — {proj} ({branch})</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ background:#0f0f0f; color:#e5e5e5; font-family:monospace; overflow:hidden; }}
+#graph {{ width:100vw; height:100vh; }}
+.node circle {{ stroke-width:1.5px; cursor:pointer; transition:r .15s; }}
+.node circle:hover {{ stroke:#fff !important; }}
+.node text {{ font-size:11px; fill:#c6d8d3; pointer-events:none; }}
+.link {{ stroke-opacity:.6; fill:none; }}
+#tooltip {{
+  position:fixed; background:#1a1a1a; border:1px solid #333;
+  padding:10px 14px; border-radius:6px; font-size:12px; line-height:1.6;
+  pointer-events:none; opacity:0; transition:opacity .15s;
+  max-width:300px; z-index:10;
+}}
+#legend {{
+  position:fixed; bottom:20px; left:20px; background:#111;
+  border:1px solid #222; border-radius:6px; padding:12px 16px; font-size:11px;
+}}
+#legend h4 {{ color:#f27059; margin-bottom:6px; font-size:11px; letter-spacing:.05em; }}
+.leg-row {{ display:flex; align-items:center; gap:7px; margin:3px 0; color:#9ca3af; }}
+.leg-dot {{ width:10px; height:10px; border-radius:50%; flex-shrink:0; }}
+.leg-line {{ width:18px; height:2px; flex-shrink:0; }}
+#info {{
+  position:fixed; top:16px; left:50%; transform:translateX(-50%);
+  color:#4a6d7c; font-size:12px; letter-spacing:.05em;
+}}
+</style>
+</head>
+<body>
+<svg id="graph"></svg>
+<div id="tooltip"></div>
+<div id="legend">
+  <h4>CHUNK TYPE</h4>
+  <div id="node-legend"></div>
+  <h4 style="margin-top:10px">EDGE TYPE</h4>
+  <div id="edge-legend"></div>
+</div>
+<div id="info">{proj} &nbsp;·&nbsp; {branch} &nbsp;·&nbsp; {len(nodes)} nodes &nbsp;·&nbsp; {len(links)} edges</div>
+<script>
+const data = {data_json};
+const legendItems = {legend_items};
+const edgeLegend = {edge_legend};
+
+// Build legends
+legendItems.forEach(d => {{
+  const row = document.createElement('div');
+  row.className = 'leg-row';
+  row.innerHTML = `<div class="leg-dot" style="background:${{d.color}}"></div><span>${{d.label}}</span>`;
+  document.getElementById('node-legend').appendChild(row);
+}});
+edgeLegend.forEach(d => {{
+  const row = document.createElement('div');
+  row.className = 'leg-row';
+  const svg = `<svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5"
+    stroke="${{d.color}}" stroke-width="2" stroke-dasharray="${{d.dash}}"/></svg>`;
+  row.innerHTML = svg + `<span>${{d.label}}</span>`;
+  document.getElementById('edge-legend').appendChild(row);
+}});
+
+const svg = d3.select('#graph');
+const width = window.innerWidth, height = window.innerHeight;
+const tooltip = document.getElementById('tooltip');
+
+const g = svg.append('g');
+svg.call(d3.zoom().scaleExtent([.1, 8]).on('zoom', e => g.attr('transform', e.transform)));
+
+// Arrow markers per edge type
+const defs = svg.append('defs');
+{_json.dumps(list(edge_colors.keys()))}.forEach(type => {{
+  const color = {_json.dumps(edge_colors)}[type];
+  defs.append('marker')
+    .attr('id', 'arrow-' + type)
+    .attr('viewBox', '0 -4 8 8').attr('refX', 18).attr('markerWidth', 6).attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path').attr('d', 'M0,-4L8,0L0,4').attr('fill', color).attr('opacity', .7);
+}});
+
+const sim = d3.forceSimulation(data.nodes)
+  .force('link', d3.forceLink(data.links).id(d => d.id).distance(d => d.type === 'RELATES_TO' ? 120 : 90))
+  .force('charge', d3.forceManyBody().strength(-260))
+  .force('center', d3.forceCenter(width / 2, height / 2))
+  .force('collision', d3.forceCollide(28));
+
+const link = g.append('g').selectAll('line')
+  .data(data.links).join('line')
+  .attr('class', 'link')
+  .attr('stroke', d => d.color)
+  .attr('stroke-width', 1.5)
+  .attr('stroke-dasharray', d => d.dash)
+  .attr('marker-end', d => `url(#arrow-${{d.type}})`);
+
+const node = g.append('g').selectAll('g')
+  .data(data.nodes).join('g')
+  .attr('class', 'node')
+  .call(d3.drag()
+    .on('start', (e, d) => {{ if (!e.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; }})
+    .on('drag',  (e, d) => {{ d.fx=e.x; d.fy=e.y; }})
+    .on('end',   (e, d) => {{ if (!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }}));
+
+node.append('circle')
+  .attr('r', d => 5 + d.importance * 1.6)
+  .attr('fill', d => d.color + (d.type === 'spec' ? '55' : 'cc'))
+  .attr('stroke', d => d.color);
+
+node.append('text')
+  .attr('dy', d => 8 + d.importance * 1.6)
+  .attr('text-anchor', 'middle')
+  .text(d => d.label);
+
+node.on('mouseover', (e, d) => {{
+  tooltip.style.opacity = 1;
+  tooltip.style.left = (e.clientX + 14) + 'px';
+  tooltip.style.top  = (e.clientY - 10) + 'px';
+  tooltip.innerHTML =
+    `<div style="color:${{d.color}};font-weight:bold;margin-bottom:4px">${{d.fullTitle}}</div>` +
+    `<div style="color:#6b7280">${{d.type}} &nbsp;·&nbsp; imp ${{d.importance}}</div>` +
+    `<div style="color:#4a6d7c;font-size:10px;margin-top:4px">${{d.id.slice(0,12)}}</div>`;
+}}).on('mousemove', e => {{
+  tooltip.style.left = (e.clientX + 14) + 'px';
+  tooltip.style.top  = (e.clientY - 10) + 'px';
+}}).on('mouseout', () => {{ tooltip.style.opacity = 0; }});
+
+sim.on('tick', () => {{
+  link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+  node.attr('transform', d => `translate(${{d.x}},${{d.y}})`);
+}});
+
+window.addEventListener('resize', () => {{
+  sim.force('center', d3.forceCenter(window.innerWidth/2, window.innerHeight/2)).alpha(.1).restart();
+}});
+</script>
+</body>
+</html>"""
+
+
+_EDGE_COLORS = {
+    "CONTRADICTS":  RED,
+    "SUPERSEDES":   AMBER,
+    "RELATES_TO":   MUTED,
+    "DERIVED_FROM": GREEN,
+    "DEPENDS_ON":   ORANGE,
+}
+
+_EDGE_LABELS = {
+    "CONTRADICTS":  "CONTRADICTS",
+    "SUPERSEDES":   "SUPERSEDES",
+    "RELATES_TO":   "RELATES TO",
+    "DERIVED_FROM": "DERIVED FROM",
+    "DEPENDS_ON":   "DEPENDS ON",
+}
+
+
+def _edge_str(edge_type: str, confidence: Optional[float], direction: str) -> str:
+    color = _EDGE_COLORS.get(edge_type, MUTED)
+    label = _EDGE_LABELS.get(edge_type, edge_type)
+    arrow = "──►" if direction == "outgoing" else "◄──"
+    conf_str = f" [{MUTED}]({confidence:.2f})[/{MUTED}]" if confidence and confidence < 1.0 else ""
+    return f"[{color}]{arrow} {label}[/{color}]{conf_str}"
+
+
+def _chunk_node_str(chunk_id: str, title: str, chunk_type: str, status: str) -> str:
+    icon = TYPE_ICONS.get(chunk_type, "·")
+    color = TYPE_COLORS.get(chunk_type, MUTED)
+    dep = f" [{GRAY}](deprecated)[/{GRAY}]" if status == "deprecated" else ""
+    return f"[{color}]{icon} {title}[/{color}]  [{MUTED}]{chunk_id[:8]}[/{MUTED}]{dep}"
+
+
+@app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
+def graph(
+    query: Optional[str] = typer.Argument(None, help="Center graph on closest matching chunk"),
+    project: Optional[str] = typer.Option(None, "--project"),
+    depth: int = typer.Option(1, "--depth", "-d", help="Hop depth for centered view (1 or 2)"),
+    open_browser: bool = typer.Option(False, "--open", "-o", help="Open interactive D3 graph in browser"),
+):
+    """Visualize memory [bold]relationship graph[/bold]. --open for Obsidian-style browser view."""
+    granum_dir = _find_granum_dir(Path(project) if project else None)
+    config = _load_config(granum_dir)
+    project_id = config["project_id"]
+
+    if open_browser:
+        with _spinner("Building graph") as status:
+            all_chunks = _get_chunks(granum_dir, project_id, config, include_deprecated=False, _status=status)
+            spec_chunks = _get_spec_chunks(granum_dir, project_id, config)
+            edges = _ipc_all_edges(granum_dir, project_id)
+            if edges is None:
+                db = _get_db(config, granum_dir)
+                db.import_ndjson()
+                edges = db.get_all_edges(project_id)
+        html_path = granum_dir / "graph.html"
+        html = _build_graph_html(all_chunks + spec_chunks, edges or [], _git_root(), _git_branch())
+        html_path.write_text(html)
+        import webbrowser
+        webbrowser.open(f"file://{html_path.resolve()}")
+        console.print(f"[{GREEN}]✓[/{GREEN}] Opened [{ORANGE}]{html_path}[/{ORANGE}]")
+        return
+
+    if query:
+        # Centered view: find closest chunk, show its neighborhood
+        with _spinner("Finding chunk") as status:
+            results = _ipc_query(granum_dir, query, config)
+            if results is None:
+                status.update("Loading database")
+                db = _get_db(config, granum_dir)
+                db.import_ndjson()
+                status.update("Searching")
+                results = db.query_context(
+                    project_id=project_id, query=query,
+                    memory_limit=1, spec_limit=0,
+                    freshness_decay_days=config.get("freshness_decay_days", 90),
+                )
+
+        memory_only = [r for r in (results or []) if r.get("type") != "spec"]
+        if not memory_only:
+            console.print(f"[{MUTED}]· No matching chunk found[/{MUTED}]")
+            return
+
+        root = memory_only[0]
+        with _spinner("Traversing graph") as status:
+            edges = _ipc_edges(granum_dir, root["id"], depth=depth)
+            if edges is None:
+                status.update("Loading database")
+                db = _get_db(config, granum_dir)
+                db.import_ndjson()
+                edges = db.get_edges(root["id"], depth=depth)
+
+        tree = Tree(_chunk_node_str(root["id"], root["title"], root["type"], root.get("status", "active")))
+
+        # Group edges by type for cleaner display
+        by_type: dict[str, list] = {}
+        for e in (edges or []):
+            by_type.setdefault(e["edge_type"], []).append(e)
+
+        for et, group in sorted(by_type.items()):
+            color = _EDGE_COLORS.get(et, MUTED)
+            label = _EDGE_LABELS.get(et, et)
+            type_branch = tree.add(f"[{color}]{label}[/{color}]")
+            for e in group:
+                conf_str = f"  [{MUTED}]({e['confidence']:.2f})[/{MUTED}]" if e.get("confidence") and e["confidence"] < 1.0 else ""
+                via_str = f"  [dim {MUTED}]via {e['via'][:8]}[/dim {MUTED}]" if e.get("via") else ""
+                dir_arrow = "►" if e["direction"] == "outgoing" else "◄"
+                node_str = _chunk_node_str(e["chunk_id"], e["title"], e["type"], e.get("status", "active"))
+                type_branch.add(f"[{MUTED}]{dir_arrow}[/{MUTED}] {node_str}{conf_str}{via_str}")
+
+        console.print(f"\n  [{MUTED}]centered on closest match to:[/{MUTED}] [{ORANGE}]{query}[/{ORANGE}]\n")
+        console.print(tree)
+        console.print()
+
+    else:
+        # Full project edge list
+        with _spinner("Loading graph") as status:
+            edges = _ipc_all_edges(granum_dir, project_id)
+            if edges is None:
+                status.update("Loading database")
+                db = _get_db(config, granum_dir)
+                db.import_ndjson()
+                edges = db.get_all_edges(project_id)
+
+        if not edges:
+            console.print(f"[{MUTED}]· No edges yet — edges form automatically as chunks are saved[/{MUTED}]")
+            return
+
+        proj = Path(_git_root() or ".").name
+        branch = _git_branch()
+        console.print(f"\n  [{ORANGE}]{proj}[/{ORANGE}]  [{MUTED}]{branch}[/{MUTED}]  [{MUTED}]·  {len(edges)} edge(s)[/{MUTED}]\n")
+
+        # Group by edge type
+        by_type: dict[str, list] = {}
+        for e in edges:
+            by_type.setdefault(e["edge_type"], []).append(e)
+
+        for et in ["CONTRADICTS", "SUPERSEDES", "DEPENDS_ON", "RELATES_TO", "DERIVED_FROM"]:
+            group = by_type.get(et, [])
+            if not group:
+                continue
+            color = _EDGE_COLORS.get(et, MUTED)
+            label = _EDGE_LABELS.get(et, et)
+            console.print(f"  [{color}]{label}[/{color}]  [{MUTED}]({len(group)})[/{MUTED}]")
+            for e in group:
+                from_icon = TYPE_ICONS.get(e["from_type"], "·")
+                from_color = TYPE_COLORS.get(e["from_type"], MUTED)
+                to_icon = TYPE_ICONS.get(e["to_type"], "·")
+                to_color = TYPE_COLORS.get(e["to_type"], MUTED)
+                conf_str = f" [{MUTED}]({e['confidence']:.2f})[/{MUTED}]" if e.get("confidence") and e["confidence"] < 1.0 else ""
+                auto_str = f" [{MUTED}][auto][/{MUTED}]" if e.get("created_by") == "auto" else ""
+                console.print(
+                    f"    [{MUTED}]{e['from_id'][:8]}[/{MUTED}] [{from_color}]{from_icon} {e['from_title'][:36]}[/{from_color}]"
+                    f"  [{color}]──►[/{color}]"
+                    f"  [{MUTED}]{e['to_id'][:8]}[/{MUTED}] [{to_color}]{to_icon} {e['to_title'][:36]}[/{to_color}]"
+                    f"{conf_str}{auto_str}"
+                )
+            console.print()
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
@@ -1109,7 +1493,7 @@ def _spinner(message: str = "Loading") -> _SpinnerCtx:
 def _dir_size(path: Path) -> str:
     if not path.exists():
         return "0 B"
-    total = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    total = path.stat().st_size if path.is_file() else sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
     for unit in ["B", "KB", "MB", "GB"]:
         if total < 1024:
             return f"{total:.1f} {unit}"
@@ -1117,22 +1501,13 @@ def _dir_size(path: Path) -> str:
     return f"{total:.1f} TB"
 
 
-def _find_possible_duplicates(chunks) -> list[tuple]:
-    seen: dict[str, list] = {}
-    for chunk in chunks:
-        key = chunk.type
-        seen.setdefault(key, []).append(chunk)
-
-    pairs = []
-    for type_chunks in seen.values():
-        for i, a in enumerate(type_chunks):
-            for b in type_chunks[i + 1:]:
-                # Simple heuristic: share 3+ words
-                words_a = set(a.title.lower().split())
-                words_b = set(b.title.lower().split())
-                if len(words_a & words_b) >= 3:
-                    pairs.append((a, b))
-    return pairs[:5]  # cap at 5 shown
+def _find_orphans(chunks, edges: list[dict]) -> list:
+    """Chunks with no edges — likely isolated/stale."""
+    connected: set[str] = set()
+    for e in edges:
+        connected.add(e["from_id"])
+        connected.add(e["to_id"])
+    return [c for c in chunks if c.id not in connected]
 
 
 def _write_mcp_json(cwd: Path) -> None:
