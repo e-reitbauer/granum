@@ -22,21 +22,21 @@ from rich.tree import Tree
 from rich import box
 
 
-_ru.STYLE_COMMANDS_TABLE_FIRST_COLUMN = "#fe9785"   # light coral — command names (palette accent)
-_ru.STYLE_OPTION = "#f27059"                        # coral — long flags
-_ru.STYLE_SWITCH = "#f27059"
-_ru.STYLE_NEGATIVE_OPTION = "#7aaabb"               # light teal — negative flags
-_ru.STYLE_NEGATIVE_SWITCH = "#7aaabb"
-_ru.STYLE_METAVAR = "#7aaabb"                       # light teal — type hints
-_ru.STYLE_OPTION_DEFAULT = "#7aaabb"
-_ru.STYLE_OPTION_ENVVAR = "#7aaabb"
-_ru.STYLE_OPTIONS_PANEL_BORDER = "#4a6d7c"          # teal border
-_ru.STYLE_COMMANDS_PANEL_BORDER = "#4a6d7c"
+_ru.STYLE_COMMANDS_TABLE_FIRST_COLUMN = "#a8d4b5"   # light sage — command names
+_ru.STYLE_OPTION = "#88c9a0"                        # soft sage — long flags
+_ru.STYLE_SWITCH = "#88c9a0"
+_ru.STYLE_NEGATIVE_OPTION = "#8bbfa8"               # muted seafoam — negative flags
+_ru.STYLE_NEGATIVE_SWITCH = "#8bbfa8"
+_ru.STYLE_METAVAR = "#8bbfa8"                       # muted seafoam — type hints
+_ru.STYLE_OPTION_DEFAULT = "#8bbfa8"
+_ru.STYLE_OPTION_ENVVAR = "#8bbfa8"
+_ru.STYLE_OPTIONS_PANEL_BORDER = "#4a7a5e"          # muted forest border
+_ru.STYLE_COMMANDS_PANEL_BORDER = "#4a7a5e"
 
 
 app = typer.Typer(
     help=(
-        "[bold #f27059]granum[/bold #f27059]  persistent semantic memory for Claude Code\n\n"
+        "[bold #4ade80]granum[/bold #4ade80]  persistent semantic memory for Claude Code\n\n"
         "Granum stores decisions, preferences, constraints and file state as vector chunks "
         "that Claude retrieves automatically at the start of each turn."
     ),
@@ -47,13 +47,13 @@ app = typer.Typer(
 console = Console()
 
 # Brand colors
-ORANGE = "#f27059"   # coral
-GREEN = "#22c55e"   # green — success
-AMBER = "#f59e0b"   # amber — warnings
-RED = "#ef4444"     # red — errors
-GRAY = "#4a6d7c"    # teal — deprecated/de-emphasized
-BODY = "#c6d8d3"    # sage
-MUTED = "#8ab4c2"   # light teal — secondary text
+ORANGE = "#88c9a0"   # soft sage green — primary accent
+GREEN  = "#6abf85"   # medium sage — success
+AMBER  = "#d4b483"   # soft amber — warnings
+RED    = "#d47f7f"   # soft rose — errors
+GRAY   = "#4a7a5e"   # muted forest — deprecated/de-emphasized
+BODY   = "#d4ead9"   # very light mint — body text
+MUTED  = "#a8d4b5"   # light sage — secondary text
 
 TYPE_ICONS = {
     "decision": "◆",
@@ -63,11 +63,11 @@ TYPE_ICONS = {
     "spec": "◇",
 }
 TYPE_COLORS = {
-    "decision":   ORANGE,    # coral
-    "constraint": AMBER,     # amber
-    "preference": "#fe9785", # light coral
-    "file_state": MUTED,     # light teal
-    "spec":       GRAY,      # teal
+    "decision":   ORANGE,    # soft sage
+    "constraint": AMBER,     # soft amber
+    "preference": "#a8d4b5", # light sage
+    "file_state": "#8bbfa8", # muted seafoam
+    "spec":       GRAY,      # muted forest
 }
 STATUS_ICONS = {"active": "✓", "deprecated": "○", "deleted": "×", "superseded": "◇"}
 
@@ -310,7 +310,7 @@ def _kv_table() -> Table:
 # Commands
 # ------------------------------------------------------------------
 
-@app.command(rich_help_panel="[bold #f27059]Setup[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Setup[/bold #4ade80]")
 def init(reset: bool = typer.Option(False, "--reset", help="Re-run spec detection")):
     """[bold]Initialize[/bold] Granum in the current project."""
     git_root = _git_root()
@@ -411,7 +411,7 @@ def init(reset: bool = typer.Option(False, "--reset", help="Re-run spec detectio
     console.print(f"[{MUTED}]Project ID: {project_id}[/{MUTED}]\n")
 
 
-@app.command("config", rich_help_panel="[bold #f27059]Setup[/bold #f27059]")
+@app.command("config", rich_help_panel="[bold #4ade80]Setup[/bold #4ade80]")
 def config_cmd(
     action: str = typer.Argument(..., help="set"),
     key: str = typer.Argument(...),
@@ -440,7 +440,7 @@ def config_cmd(
     console.print(f"[{GREEN}]✓[/{GREEN}] [{ORANGE}]{key}[/{ORANGE}] = [{BODY}]{config[key]}[/{BODY}]")
 
 
-@app.command("list", rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command("list", rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def list_cmd(
     project: Optional[str] = typer.Option(None, "--project", help="Path to project root"),
     type_filter: Optional[str] = typer.Option(None, "--type", help="Filter by chunk type"),
@@ -489,7 +489,7 @@ def list_cmd(
         console.print(_table_panel(spec_table, f"specs  {len(spec_chunks)}"))
 
 
-@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def recent(
     n: int = typer.Option(10, "--n", help="Number of chunks to show"),
     project: Optional[str] = typer.Option(None, "--project"),
@@ -527,7 +527,7 @@ def recent(
     console.print(_table_panel(table, f"recent  {len(chunks)} chunk(s)  ·  {len(spec_chunks)} spec(s)"))
 
 
-@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def stale(project: Optional[str] = typer.Option(None, "--project")):
     """List [bold]stale[/bold] chunks that need review, oldest first."""
     granum_dir = _find_granum_dir(Path(project) if project else None)
@@ -553,7 +553,7 @@ def stale(project: Optional[str] = typer.Option(None, "--project")):
     console.print(_table_panel(table, f"stale  {len(stale_chunks)}  >{threshold}d"))
 
 
-@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def search(
     query: str = typer.Argument(...),
     project: Optional[str] = typer.Option(None, "--project"),
@@ -596,7 +596,7 @@ def search(
     console.print(_table_panel(table, f"results  {len(results)}"))
 
 
-@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def delete(chunk_id: str = typer.Argument(...)):
     """[bold]Soft-delete[/bold] a chunk by ID prefix."""
     granum_dir = _find_granum_dir()
@@ -638,7 +638,7 @@ def delete(chunk_id: str = typer.Argument(...)):
             console.print(f"[{RED}]✗ Chunk not found: {chunk_id}[/{RED}]")
 
 
-@app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
 def stats(project: Optional[str] = typer.Option(None, "--project")):
     """Show project memory [bold]statistics[/bold]."""
     granum_dir = _find_granum_dir(Path(project) if project else None)
@@ -677,7 +677,7 @@ def stats(project: Optional[str] = typer.Option(None, "--project")):
     console.print(Panel(t, title=f"[bold {ORANGE}]stats[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
 
 
-@app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
 def audit(project: Optional[str] = typer.Option(None, "--project")):
     """Memory [bold]health report[/bold] — stale, duplicates, low-value chunks."""
     granum_dir = _find_granum_dir(Path(project) if project else None)
@@ -749,7 +749,7 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
         console.print(f"[{MUTED}]→ run cleanup_context on {len(low_value)} low-value chunk(s)[/{MUTED}]")
 
 
-@app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
 def timeline(
     project: Optional[str] = typer.Option(None, "--project"),
     months: int = typer.Option(1, "--months", "-m", help="Number of months to show"),
@@ -829,18 +829,18 @@ def _build_graph_html(chunks, edges: list[dict], git_root: Optional[str], branch
 
     proj = Path(git_root or ".").name
     type_colors = {
-        "decision":   "#f27059",
-        "constraint": "#f59e0b",
-        "preference": "#fe9785",
-        "file_state": "#8ab4c2",
-        "spec":       "#4a6d7c",
+        "decision":   "#88c9a0",
+        "constraint": "#d4b483",
+        "preference": "#a8d4b5",
+        "file_state": "#8bbfa8",
+        "spec":       "#4a7a5e",
     }
     edge_colors = {
-        "CONTRADICTS":  "#ef4444",
-        "SUPERSEDES":   "#f59e0b",
-        "RELATES_TO":   "#6b7280",
-        "DERIVED_FROM": "#22c55e",
-        "DEPENDS_ON":   "#f27059",
+        "CONTRADICTS":  "#d47f7f",
+        "SUPERSEDES":   "#d4b483",
+        "RELATES_TO":   "#88c9a0",
+        "DERIVED_FROM": "#6abf85",
+        "DEPENDS_ON":   "#a8d4b5",
     }
     edge_dash = {"CONTRADICTS": "6,3", "SUPERSEDES": "4,2"}
 
@@ -890,7 +890,7 @@ body {{ background:#0f0f0f; color:#e5e5e5; font-family:monospace; overflow:hidde
 #graph {{ width:100vw; height:100vh; }}
 .node circle {{ stroke-width:1.5px; cursor:pointer; transition:r .15s; }}
 .node circle:hover {{ stroke:#fff !important; }}
-.node text {{ font-size:11px; fill:#c6d8d3; pointer-events:none; }}
+.node text {{ font-size:11px; fill:#d4ead9; pointer-events:none; }}
 .link {{ stroke-opacity:.6; fill:none; }}
 #tooltip {{
   position:fixed; background:#1a1a1a; border:1px solid #333;
@@ -902,13 +902,13 @@ body {{ background:#0f0f0f; color:#e5e5e5; font-family:monospace; overflow:hidde
   position:fixed; bottom:20px; left:20px; background:#111;
   border:1px solid #222; border-radius:6px; padding:12px 16px; font-size:11px;
 }}
-#legend h4 {{ color:#f27059; margin-bottom:6px; font-size:11px; letter-spacing:.05em; }}
+#legend h4 {{ color:#4ade80; margin-bottom:6px; font-size:11px; letter-spacing:.05em; }}
 .leg-row {{ display:flex; align-items:center; gap:7px; margin:3px 0; color:#9ca3af; }}
 .leg-dot {{ width:10px; height:10px; border-radius:50%; flex-shrink:0; }}
 .leg-line {{ width:18px; height:2px; flex-shrink:0; }}
 #info {{
   position:fixed; top:16px; left:50%; transform:translateX(-50%);
-  color:#4a6d7c; font-size:12px; letter-spacing:.05em;
+  color:#4a7a5e; font-size:12px; letter-spacing:.05em;
 }}
 </style>
 </head>
@@ -999,8 +999,8 @@ node.on('mouseover', (e, d) => {{
   tooltip.style.top  = (e.clientY - 10) + 'px';
   tooltip.innerHTML =
     `<div style="color:${{d.color}};font-weight:bold;margin-bottom:4px">${{d.fullTitle}}</div>` +
-    `<div style="color:#6b7280">${{d.type}} &nbsp;·&nbsp; imp ${{d.importance}}</div>` +
-    `<div style="color:#4a6d7c;font-size:10px;margin-top:4px">${{d.id.slice(0,12)}}</div>`;
+    `<div style="color:#a8d4b5">${{d.type}} &nbsp;·&nbsp; imp ${{d.importance}}</div>` +
+    `<div style="color:#4a7a5e;font-size:10px;margin-top:4px">${{d.id.slice(0,12)}}</div>`;
 }}).on('mousemove', e => {{
   tooltip.style.left = (e.clientX + 14) + 'px';
   tooltip.style.top  = (e.clientY - 10) + 'px';
@@ -1052,7 +1052,7 @@ def _chunk_node_str(chunk_id: str, title: str, chunk_type: str, status: str) -> 
     return f"[{color}]{icon} {title}[/{color}]  [{MUTED}]{chunk_id[:8]}[/{MUTED}]{dep}"
 
 
-@app.command(rich_help_panel="[bold #f27059]Analysis[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
 def graph(
     query: Optional[str] = typer.Argument(None, help="Center graph on closest matching chunk"),
     project: Optional[str] = typer.Option(None, "--project"),
@@ -1174,7 +1174,7 @@ def graph(
             console.print()
 
 
-@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def history(
     chunk_id: str = typer.Argument(..., help="Chunk ID prefix to inspect version history"),
     project: Optional[str] = typer.Option(None, "--project"),
@@ -1227,7 +1227,7 @@ def history(
     console.print()
 
 
-@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+@app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
 def clear(
     project: Optional[str] = typer.Option(None, "--project"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
@@ -1256,7 +1256,7 @@ def clear(
     console.print(f"[{GREEN}]✓[/{GREEN}] Cleared [{ORANGE}]{len(chunks)}[/{ORANGE}] chunk(s)")
 
 
-@app.command("export", rich_help_panel="[bold #f27059]Data[/bold #f27059]")
+@app.command("export", rich_help_panel="[bold #4ade80]Data[/bold #4ade80]")
 def export_cmd(project: Optional[str] = typer.Option(None, "--project")):
     """Export chunks to [bold].granum/chunks.ndjson[/bold]."""
     granum_dir = _find_granum_dir(Path(project) if project else None)
@@ -1270,7 +1270,7 @@ def export_cmd(project: Optional[str] = typer.Option(None, "--project")):
     console.print(f"[{GREEN}]✓[/{GREEN}] Exported to [{ORANGE}].granum/chunks.ndjson[/{ORANGE}]")
 
 
-@app.command("import", rich_help_panel="[bold #f27059]Data[/bold #f27059]")
+@app.command("import", rich_help_panel="[bold #4ade80]Data[/bold #4ade80]")
 def import_cmd(project: Optional[str] = typer.Option(None, "--project")):
     """Import chunks from [bold].granum/chunks.ndjson[/bold]."""
     granum_dir = _find_granum_dir(Path(project) if project else None)
@@ -1285,11 +1285,11 @@ def import_cmd(project: Optional[str] = typer.Option(None, "--project")):
 
 
 specs_app = typer.Typer(
-    help="Manage [bold #f27059]spec paths[/bold #f27059] — source files indexed as read-only context chunks.",
+    help="Manage [bold #4ade80]spec paths[/bold #4ade80] — source files indexed as read-only context chunks.",
     rich_markup_mode="rich",
     no_args_is_help=True,
 )
-app.add_typer(specs_app, name="specs", rich_help_panel="[bold #f27059]Specs[/bold #f27059]")
+app.add_typer(specs_app, name="specs", rich_help_panel="[bold #4ade80]Specs[/bold #4ade80]")
 
 
 @specs_app.command("list")
@@ -1414,7 +1414,7 @@ server_app = typer.Typer(
     rich_markup_mode="rich",
     no_args_is_help=True,
 )
-app.add_typer(server_app, name="server", rich_help_panel="[bold #f27059]Debug[/bold #f27059]")
+app.add_typer(server_app, name="server", rich_help_panel="[bold #4ade80]Debug[/bold #4ade80]")
 
 
 @server_app.command("status")
@@ -1488,8 +1488,8 @@ def server_logs():
 # Internal helpers
 # ------------------------------------------------------------------
 
-_SHIMMER_BRIGHT = (0xfe, 0x97, 0x85)   # light coral
-_SHIMMER_DIM = (0xf2, 0x70, 0x59)     # coral
+_SHIMMER_BRIGHT = (0xd4, 0xea, 0xd9)   # very light mint — highlight peak
+_SHIMMER_DIM = (0x6a, 0x9e, 0x78)     # muted sage — base
 _SHIMMER_WIDTH = 5.0
 
 
