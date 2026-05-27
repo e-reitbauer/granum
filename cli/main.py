@@ -188,13 +188,8 @@ def _get_chunks(granum_dir: Path, project_id: str, config: dict, include_depreca
         from mcp_server.models import Chunk
         return [Chunk.from_dict(d) for d in raw]
     if _status:
-        _status.update("Opening database (no MCP server)")
+        _status.update("Querying memory store (direct)")
     db = _get_db(config, granum_dir)
-    if _status:
-        _status.update("Importing chunks from disk")
-    db.import_ndjson()
-    if _status:
-        _status.update("Querying memory store")
     return db.get_all_memory_chunks(project_id, include_deprecated=include_deprecated)
 
 
@@ -571,10 +566,8 @@ def search(
     with _spinner("Embedding query") as status:
         results = _ipc_query(granum_dir, query, config)
         if results is None:
-            status.update("Loading database")
+            status.update("Running similarity search (direct)")
             db = _get_db(config, granum_dir)
-            db.import_ndjson()
-            status.update("Running similarity search")
             raw = db.query_context(
                 project_id=project_id,
                 query=query,
@@ -617,10 +610,8 @@ def delete(chunk_id: str = typer.Argument(...)):
         console.print(f"[{MUTED}]· Cancelled[/{MUTED}]")
         return
 
-    with _spinner("Loading database") as status:
+    with _spinner("Deleting chunk") as status:
         db = _get_db(config, granum_dir)
-        db.import_ndjson()
-        status.update("Deleting chunk")
         ok = db.soft_delete(chunk_id)
         if ok:
             status.update("Saving to disk")
@@ -702,7 +693,6 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
         all_edges = _ipc_all_edges(granum_dir, project_id)
         if all_edges is None:
             db = _get_db(config, granum_dir)
-            db.import_ndjson()
             all_edges = db.get_all_edges(project_id)
         status.update("Analysing")
         active = [c for c in all_chunks if c.status == "active"]
@@ -1082,10 +1072,7 @@ def graph(
             status.update("Loading graph edges")
             edges = _ipc_all_edges(granum_dir, project_id)
             if edges is None:
-                status.update("Loading database")
                 db = _get_db(config, granum_dir)
-                db.import_ndjson()
-                status.update("Loading graph edges")
                 edges = db.get_all_edges(project_id)
             status.update(f"Generating graph  {len(all_chunks + spec_chunks)} nodes · {len(edges or [])} edges")
         html_path = granum_dir / "graph.html"
@@ -1101,10 +1088,7 @@ def graph(
         with _spinner("Finding chunk") as status:
             results = _ipc_query(granum_dir, query, config)
             if results is None:
-                status.update("Loading database")
                 db = _get_db(config, granum_dir)
-                db.import_ndjson()
-                status.update("Searching")
                 raw = db.query_context(
                     project_id=project_id, query=query,
                     memory_limit=1, spec_limit=0,
@@ -1121,9 +1105,7 @@ def graph(
         with _spinner("Traversing graph") as status:
             edges = _ipc_edges(granum_dir, root["id"], depth=depth)
             if edges is None:
-                status.update("Loading database")
                 db = _get_db(config, granum_dir)
-                db.import_ndjson()
                 edges = db.get_edges(root["id"], depth=depth)
 
         tree = Tree(_chunk_node_str(root["id"], root["title"], root["type"], root.get("status", "active")))
@@ -1153,9 +1135,7 @@ def graph(
         with _spinner("Loading graph") as status:
             edges = _ipc_all_edges(granum_dir, project_id)
             if edges is None:
-                status.update("Loading database")
                 db = _get_db(config, granum_dir)
-                db.import_ndjson()
                 edges = db.get_all_edges(project_id)
 
         if not edges:
@@ -1219,7 +1199,6 @@ def history(
         versions = _ipc_chunk_history(granum_dir, full_id)
         if versions is None:
             db = _get_db(config, granum_dir)
-            db.import_ndjson()
             versions = db.get_chunk_history(full_id)
 
     icon = TYPE_ICONS.get(current.type, "◆")
@@ -1265,9 +1244,8 @@ def clear(
             console.print(f"[{MUTED}]· Cancelled[/{MUTED}]")
             return
 
-    with _spinner("Loading database") as status:
+    with _spinner("Loading chunks") as status:
         db = _get_db(config, granum_dir)
-        db.import_ndjson()
         chunks = db.get_all_memory_chunks(project_id, include_deprecated=True)
         status.update(f"Deleting {len(chunks)} chunks")
         for chunk in chunks:
@@ -1285,10 +1263,8 @@ def export_cmd(project: Optional[str] = typer.Option(None, "--project")):
     config = _load_config(granum_dir)
     project_id = config["project_id"]
 
-    with _spinner("Loading database") as status:
+    with _spinner("Writing chunks.ndjson") as status:
         db = _get_db(config, granum_dir)
-        db.import_ndjson()
-        status.update("Writing chunks.ndjson")
         db.export_ndjson(project_id)
 
     console.print(f"[{GREEN}]✓[/{GREEN}] Exported to [{ORANGE}].granum/chunks.ndjson[/{ORANGE}]")
@@ -1303,7 +1279,7 @@ def import_cmd(project: Optional[str] = typer.Option(None, "--project")):
     with _spinner("Reading chunks.ndjson") as status:
         db = _get_db(config, granum_dir)
         status.update("Importing to database")
-        count = db.import_ndjson()
+        count = db.import_ndjson(force=True)
 
     console.print(f"[{GREEN}]✓[/{GREEN}] Imported [{ORANGE}]{count}[/{ORANGE}] chunk(s)")
 

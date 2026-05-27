@@ -119,6 +119,7 @@ class GranumDB:
         self.db_path = db_path
         self.ndjson_path = ndjson_path
         self.edges_ndjson_path = ndjson_path.parent / "edges.ndjson"
+        self._import_ts_path = ndjson_path.parent / "last_import_ts"
         self.stale_threshold_days = stale_threshold_days
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -392,7 +393,32 @@ class GranumDB:
     # Import / export
     # ------------------------------------------------------------------
 
-    def import_ndjson(self) -> int:
+    def _ndjson_mtime(self) -> float:
+        """Combined mtime of chunks.ndjson + edges.ndjson."""
+        t = 0.0
+        for p in (self.ndjson_path, self.edges_ndjson_path):
+            if p.exists():
+                t = max(t, p.stat().st_mtime)
+        return t
+
+    def _read_import_ts(self) -> float:
+        try:
+            return float(self._import_ts_path.read_text().strip())
+        except Exception:
+            return 0.0
+
+    def _write_import_ts(self) -> None:
+        try:
+            self._import_ts_path.write_text(str(self._ndjson_mtime()))
+        except Exception:
+            pass
+
+    def import_ndjson(self, force: bool = False) -> int:
+        if not force:
+            mtime = self._ndjson_mtime()
+            if mtime > 0 and mtime <= self._read_import_ts():
+                return 0  # NDJSON unchanged since last import — skip
+
         count = 0
         if self.ndjson_path.exists():
             with self.ndjson_path.open() as f:
@@ -426,6 +452,7 @@ class GranumDB:
                         )
                     except Exception:
                         continue
+        self._write_import_ts()
         return count
 
     def export_ndjson(self, project_id: str) -> None:
@@ -520,6 +547,9 @@ class GranumDB:
         with self.edges_ndjson_path.open("w") as f:
             for e in existing.values():
                 f.write(json.dumps(e) + "\n")
+
+        # DB is now in sync with what we just wrote
+        self._write_import_ts()
 
     # ------------------------------------------------------------------
     # save_context
