@@ -107,15 +107,12 @@ granum/
     db.py           Kuzu graph DB + embedding logic
     models.py       Chunk schema
   hooks/
-    granum-log.sh          UserPromptSubmit — prompt logging
-    granum-compact.sh      Stop — compaction counter
+    granum-log.sh          UserPromptSubmit — prompt logging + per-turn reminders
     granum-coldstart.sh    SessionStart — cold start injection
     granum-reinject.sh     SessionStart — post-compaction reinject
-    granum-spec-sync.sh    PostToolUse — spec reindex on file edit
   cli/
     main.py         CLI (typer + rich)
   .mcp.json
-  plugin.json
   pyproject.toml
 ```
 

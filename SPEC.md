@@ -118,19 +118,6 @@ Spec files changed since last session:
 Review and deprecate any conflicting Granum memory chunks.
 ```
 
-### PostToolUse hook on spec file writes
-
-When Claude edits a file matching `spec_paths`:
-
-```bash
-# granum-spec-sync.sh (PostToolUse, matcher: Edit|Write)
-# If edited path matches any entry in spec_paths:
-#   → re-index that file's spec chunks immediately
-#   → query for memory chunks semantically overlapping the changed section
-#   → inject warning: "Spec file re-indexed. Review these memory chunks for conflicts: [list]"
-# Claude decides to deprecate/update/keep affected memory chunks
-```
-
 ---
 
 ## Collaborative Sharing
@@ -204,16 +191,6 @@ All hooks: timeout protection, fail-open (exit 0 on error), stderr logging.
 # Timeout: 2s
 ```
 
-### `Stop`
-```bash
-# granum-compact.sh
-# Increments .granum/tool_call_count
-# If >= compaction_threshold: triggers /compact, resets counter
-# Safety net only — Claude self-triggers first
-# Timeout: 10s
-# Note: replace with CLAUDE_CONTEXT_PERCENT when Anthropic ships it
-```
-
 ### `SessionStart` (matcher: `compact`)
 ```bash
 # granum-reinject.sh
@@ -250,13 +227,12 @@ Injected format after compaction:
 # Timeout: 10s
 ```
 
-### `PostToolUse` (matcher: `Edit|Write`)
+### `UserPromptSubmit`
 ```bash
-# granum-spec-sync.sh
-# If edited file path matches any entry in spec_paths:
-#   → find semantically overlapping Granum chunks
-#   → inject conflict warning into context
-# Claude decides to deprecate/update/keep affected chunks
+# granum-log.sh
+# Appends prompt to session.log (last 20 entries)
+# Injects per-turn reminders: query_context, save rules, reindex_specs
+# Detects session-end phrases → reminds save_handoff
 # Timeout: 5s
 ```
 
@@ -576,17 +552,14 @@ $ granum server logs
 
 ```
 granum/
-  plugin.json
   mcp_server/
     server.py             # MCP server entrypoint
-    db.py                 # ChromaDB + embedding logic
+    db.py                 # Kuzu graph DB + embedding logic
     models.py             # Chunk schema
   hooks/
-    granum-log.sh          # UserPromptSubmit (logging only)
-    granum-compact.sh      # Stop
+    granum-log.sh          # UserPromptSubmit — logging + per-turn reminders
     granum-reinject.sh     # SessionStart (compact)
     granum-coldstart.sh    # SessionStart (startup)
-    granum-spec-sync.sh    # PostToolUse (Edit|Write)
   cli/
     main.py               # typer CLI
   CLAUDE.md

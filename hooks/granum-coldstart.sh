@@ -36,4 +36,12 @@ except Exception as e:
     print(f"[granum] coldstart error: {e}", file=sys.stderr)
 PYEOF
 
+cat <<'MSG'
+[granum] Session start sequence — run in order:
+  1. query_context with the user's first message
+     → if unresolved_conflicts returned: resolve via cleanup_context or add_edge(CONTRADICTS) first
+  2. check_drift — verify stale file_state chunks against the codebase
+  3. get_recent_changes(hours=24) — only if user asks about last session or seems to be continuing work
+MSG
+
 exit 0

@@ -112,21 +112,19 @@ _SERVER_INSTRUCTIONS = (
     "  If you are unsure about a past decision, a file's current state, a user preference, or a constraint,\n"
     "  call query_context with a focused query before guessing. You may have already saved the answer.\n\n"
 
-    "SAVE TRIGGERS — save_context is REQUIRED after any turn where:\n"
-    "  - You chose a tech stack, library, framework, or tool\n"
-    "  - You created, renamed, moved, or deleted a file or module\n"
-    "  - You made an architectural decision (structure, patterns, APIs, data models)\n"
-    "  - The user stated a preference about style, workflow, naming, or behavior\n"
-    "  - The user accepted a non-obvious approach without pushback — that silence is confirmation, save it\n"
-    "  - You discovered a constraint (env limitation, dependency conflict, version pin)\n"
-    "  - You observed code or behavior that contradicts an existing spec chunk or memory chunk (save the discrepancy, importance 4+)\n"
-    "  - You encountered a surprising or non-obvious behavior that would trip up a future session\n"
-    "  - You fixed a non-trivial bug (save what the bug was and how it was fixed)\n"
-    "  - You completed a feature or significant unit of work\n"
-    "  - The user corrected you or changed direction\n\n"
-
-    "Save multiple chunks per turn if multiple things happened. Be specific in titles.\n"
-    "Bad title: 'user preference'. Good title: 'user prefers tabs over spaces in Python files'.\n\n"
+    "WHAT TO SAVE — save decisions, not file writes. Ask: would a future session need this to make good choices?\n\n"
+    "  RULE 1 — User picks from options you presented = save that choice before responding.\n"
+    "  'option b', '2', 'yes', 'the first one' — any selection is a decision. Save it.\n"
+    "  Example: user picked localStorage → save_context(title='todo app uses localStorage for persistence', type='decision', importance=4)\n"
+    "  Example: user said 'clean' style → save_context(title='todo app: clean minimal style, single accent color', type='preference')\n\n"
+    "  RULE 2 — You chose or recommended an approach and proceeded with it = save it.\n"
+    "  Tech stack, architecture pattern, data structure, state strategy — if you picked it, save it.\n"
+    "  Example: chose full re-render → save_context(title='todo app: full DOM re-render on every state change', type='decision')\n\n"
+    "  RULE 3 — User corrected you or changed direction = save immediately, importance 4+.\n\n"
+    "  RULE 4 — Feature complete, bug fixed, surprising behavior found = save what happened and why it matters.\n\n"
+    "  File writes alone do NOT require save_context. Save what was DECIDED, not what was typed.\n"
+    "  Multiple things happened = multiple chunks. Never batch into one vague chunk.\n"
+    "  Bad title: 'user preference'. Good title: 'user prefers tabs over spaces in Python files'.\n\n"
 
     "Chunk types:\n"
     "  decision    — architectural or implementation choices\n"
@@ -136,24 +134,24 @@ _SERVER_INSTRUCTIONS = (
     "  file_state  — current state of files, modules, or systems\n\n"
 
     "Importance scale:\n"
-    "  5 — architectural, affects all future work (e.g. chosen DB, auth strategy)\n"
+    "  5 — architectural, affects all future work (e.g. chosen DB, auth strategy, core data model)\n"
     "  4 — significant, affects a subsystem or workflow\n"
     "  3 — default, useful context\n"
     "  2 — minor, narrow scope\n"
     "  1 — cosmetic or rarely relevant\n\n"
 
     "AUDIT: when the user reports a wrong answer, or when you act on a chunk naming a specific file/function/flag —\n"
-    "  call list_chunks, verify stale entries, then cleanup_context to deprecate or merge.\n"
-    "After editing a spec file: call reindex_specs so changes are immediately searchable.\n\n"
-    "GRAPH EDGES — required every time you call save_context:\n"
-    "  After every save_context call, immediately call add_edge for each relationship you know:\n"
+    "  call list_chunks, verify stale entries, then cleanup_context to deprecate or merge.\n\n"
+    "GRAPH EDGES — required after every save_context call:\n"
+    "  save_context returns the chunk ID. Use it immediately in add_edge calls.\n"
     "  - New chunk SUPERSEDES an older one on the same topic → add_edge(new_id, old_id, SUPERSEDES)\n"
     "  - New chunk DEPENDS_ON another (can't be understood without it) → add_edge(new_id, dep_id, DEPENDS_ON)\n"
+    "     Example: 'uses localStorage' DEPENDS_ON 'raw HTML/CSS/JS, no build step'\n"
     "  - New chunk CONTRADICTS an existing one (mutually exclusive) → add_edge(new_id, conflict_id, CONTRADICTS)\n"
     "  - New chunk was DERIVED_FROM merging others → add_edge(new_id, source_id, DERIVED_FROM)\n"
+    "  If you saved multiple chunks this turn, add edges BETWEEN them too, not just to old chunks.\n"
     "  Do not skip this step. No edges = no graph traversal = worse retrieval next session.\n"
-    "  RELATES_TO is auto-detected by embedding similarity — never declare it manually.\n"
-    "  Check the 'conflicts' field on query_context results — those are existing CONTRADICTS pairs to act on.\n\n"
+    "  RELATES_TO is auto-detected by similarity — never declare it manually.\n\n"
     "GRAPH RAG — query_context now uses graph traversal in addition to similarity:\n"
     "  Phase 1: similarity seeds all chunks above 0.3 threshold.\n"
     "  Phase 2: BFS from top-5 memory seeds over DEPENDS_ON, RELATES_TO, DERIVED_FROM, SUPERSEDES (depth ≤ 2).\n"
@@ -247,7 +245,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="cleanup_context",
-            description="Delete, deprecate, merge, or update existing memory chunks.",
+            description="Delete, deprecate, merge, or update existing memory chunks. Use when a chunk is outdated, superseded by a new decision, conflicts with another chunk, or two chunks cover the same topic and should be one.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -281,7 +279,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_chunk",
-            description="Get full content of a specific memory chunk by ID.",
+            description="Get full content of a specific memory chunk by ID. Use when query_context returned a chunk with a truncated summary and you need the full detail before acting on it.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -289,14 +287,6 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["chunk_id"],
             },
-        ),
-        Tool(
-            name="reindex_specs",
-            description=(
-                "Re-index all spec files from configured spec_paths. "
-                "Call this after editing or creating a spec file so the changes are immediately searchable."
-            ),
-            inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="add_edge",
@@ -448,10 +438,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if chunk is None:
                 return [TextContent(type="text", text=json.dumps({"error": "chunk not found"}))]
             return [TextContent(type="text", text=json.dumps(chunk.to_dict(), indent=2))]
-
-        elif name == "reindex_specs":
-            count = _reindex_all_specs()
-            return [TextContent(type="text", text=json.dumps({"indexed": count}))]
 
         elif name == "add_edge":
             result = db.add_edge(

@@ -342,7 +342,7 @@ def init(reset: bool = typer.Option(False, "--reset", help="Re-run spec detectio
     detected: list[str] = []
 
     known_patterns = [
-        "openspec/specs/", "docs/", "AGENTS.md", "CLAUDE.md",
+        "openspec/", "docs/", "AGENTS.md", "CLAUDE.md",
         ".cursorrules", "GEMINI.md",
     ]
     for pattern in known_patterns:
@@ -2047,10 +2047,8 @@ def _write_claude_settings(cwd: Path, write_hooks: bool) -> None:
             hooks[event].append(entry)
 
         _set_hook("UserPromptSubmit", None, "granum-log.sh")
-        _set_hook("Stop", None, "granum-compact.sh")
         _set_hook("SessionStart", "startup", "granum-coldstart.sh")
         _set_hook("SessionStart", "compact", "granum-reinject.sh")
-        _set_hook("PostToolUse", "Edit|Write", "granum-spec-sync.sh")
 
         console.print(f"[{GREEN}]✓[/{GREEN}] Hooks registered in [{ORANGE}].claude/settings.json[/{ORANGE}]")
     else:

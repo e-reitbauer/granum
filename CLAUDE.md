@@ -35,17 +35,14 @@ Granum is a Claude Code plugin that replaces context-based memory with a persist
 
 ```
 granum/
-  plugin.json
   mcp_server/
     server.py        # MCP server entrypoint (stdio, JSON-RPC)
     db.py            # ChromaDB + embedding logic
     models.py        # Chunk schema
   hooks/
-    granum-log.sh          # UserPromptSubmit — logging only
-    granum-compact.sh      # Stop — compaction counter
+    granum-log.sh          # UserPromptSubmit — prompt logging + per-turn reminders
     granum-reinject.sh     # SessionStart (compact matcher)
     granum-coldstart.sh    # SessionStart (startup matcher)
-    granum-spec-sync.sh    # PostToolUse (Edit|Write matcher)
   cli/
     main.py          # typer CLI
   .mcp.json
