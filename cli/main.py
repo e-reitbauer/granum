@@ -69,7 +69,7 @@ TYPE_COLORS = {
     "file_state": MUTED,     # light teal
     "spec":       GRAY,      # teal
 }
-STATUS_ICONS = {"active": "✓", "deprecated": "○", "deleted": "×"}
+STATUS_ICONS = {"active": "✓", "deprecated": "○", "deleted": "×", "superseded": "◇"}
 
 
 # ------------------------------------------------------------------
@@ -161,6 +161,10 @@ def _ipc_spec_chunks(granum_dir: Path, project_id: str) -> Optional[list]:
     return _ipc_call(granum_dir, "list_spec_chunks", {"project_id": project_id})
 
 
+def _ipc_chunk_history(granum_dir: Path, chunk_id: str) -> Optional[list]:
+    return _ipc_call(granum_dir, "get_chunk_history", {"chunk_id": chunk_id})
+
+
 def _get_spec_chunks(granum_dir: Path, project_id: str, config: dict) -> list:
     raw = _ipc_spec_chunks(granum_dir, project_id)
     if raw is not None:
@@ -178,9 +182,13 @@ def _get_chunks(granum_dir: Path, project_id: str, config: dict, include_depreca
         from mcp_server.models import Chunk
         return [Chunk.from_dict(d) for d in raw]
     if _status:
-        _status.update("Warming up database")
+        _status.update("Opening database (no MCP server)")
     db = _get_db(config, granum_dir)
+    if _status:
+        _status.update("Importing chunks from disk")
     db.import_ndjson()
+    if _status:
+        _status.update("Querying memory store")
     return db.get_all_memory_chunks(project_id, include_deprecated=include_deprecated)
 
 
@@ -526,8 +534,9 @@ def stale(project: Optional[str] = typer.Option(None, "--project")):
     project_id = config["project_id"]
     threshold = config.get("stale_threshold_days", 7)
 
-    with _spinner("Checking chunk freshness") as status:
+    with _spinner("Loading chunks") as status:
         chunks = _get_chunks(granum_dir, project_id, config, _status=status)
+        status.update("Checking freshness")
 
     stale_chunks = [c for c in chunks if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
     stale_chunks.sort(key=lambda c: c.updated_at)
@@ -1047,14 +1056,19 @@ def graph(
     project_id = config["project_id"]
 
     if open_browser:
-        with _spinner("Building graph") as status:
+        with _spinner("Loading memory chunks") as status:
             all_chunks = _get_chunks(granum_dir, project_id, config, include_deprecated=False, _status=status)
+            status.update("Loading spec chunks")
             spec_chunks = _get_spec_chunks(granum_dir, project_id, config)
+            status.update("Loading graph edges")
             edges = _ipc_all_edges(granum_dir, project_id)
             if edges is None:
+                status.update("Loading database")
                 db = _get_db(config, granum_dir)
                 db.import_ndjson()
+                status.update("Loading graph edges")
                 edges = db.get_all_edges(project_id)
+            status.update(f"Generating graph  {len(all_chunks + spec_chunks)} nodes · {len(edges or [])} edges")
         html_path = granum_dir / "graph.html"
         html = _build_graph_html(all_chunks + spec_chunks, edges or [], _git_root(), _git_branch())
         html_path.write_text(html)
@@ -1158,6 +1172,60 @@ def graph(
                     f"{conf_str}{auto_str}"
                 )
             console.print()
+
+
+@app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")
+def history(
+    chunk_id: str = typer.Argument(..., help="Chunk ID prefix to inspect version history"),
+    project: Optional[str] = typer.Option(None, "--project"),
+):
+    """Show [bold]version history[/bold] for a chunk (SUPERSEDES chain)."""
+    granum_dir = _find_granum_dir(Path(project) if project else None)
+    config = _load_config(granum_dir)
+    project_id = config["project_id"]
+
+    with _spinner("Loading chunks") as status:
+        chunks = _get_chunks(granum_dir, project_id, config, include_deprecated=True, _status=status)
+        status.update("Loading spec chunks")
+        spec_chunks = _get_spec_chunks(granum_dir, project_id, config)
+        all_chunks = list(chunks) + list(spec_chunks)
+        matched = [c for c in all_chunks if c.id.startswith(chunk_id)]
+        if not matched:
+            console.print(f"[{RED}]✗[/{RED}] No chunk found with id prefix [{MUTED}]{chunk_id}[/{MUTED}]")
+            raise typer.Exit(1)
+        current = matched[0]
+        full_id = current.id
+        status.update("Loading version history")
+        versions = _ipc_chunk_history(granum_dir, full_id)
+        if versions is None:
+            db = _get_db(config, granum_dir)
+            db.import_ndjson()
+            versions = db.get_chunk_history(full_id)
+
+    icon = TYPE_ICONS.get(current.type, "◆")
+    color = TYPE_COLORS.get(current.type, ORANGE)
+
+    console.print()
+    console.print(f"[{ORANGE}]◆ Version history —[/{ORANGE}] [{color}]{icon} {current.title}[/{color}]")
+    console.print(f"  [{MUTED}]{full_id[:12]}[/{MUTED}]")
+    console.print()
+
+    age = _age_str(_age_seconds(current.updated_at or ""))
+    console.print(f"  [{GREEN}]✓ current[/{GREEN}]  [{BODY}]{current.content[:120]}[/{BODY}]")
+    console.print(f"  [{MUTED}]  updated {age} · importance {current.importance}[/{MUTED}]")
+
+    if not versions:
+        console.print()
+        console.print(f"  [{MUTED}]· No prior versions (chunk has never been updated)[/{MUTED}]")
+    else:
+        for i, v in enumerate(versions):
+            age_v = _age_str(_age_seconds(v.get("updated_at", "")))
+            snap_id = v["id"]
+            console.print()
+            console.print(f"  [{AMBER}]v{len(versions) - i}[/{AMBER}]  [{MUTED}]{snap_id[-14:]}[/{MUTED}]  [{MUTED}]updated {age_v}[/{MUTED}]")
+            console.print(f"  [{GRAY}]{v.get('content', '')[:120]}[/{GRAY}]")
+
+    console.print()
 
 
 @app.command(rich_help_panel="[bold #f27059]Memory[/bold #f27059]")

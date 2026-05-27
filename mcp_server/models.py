@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Literal, Optional
 
 ChunkType = Literal["decision", "preference", "file_state", "constraint", "spec"]
-ChunkStatus = Literal["active", "deprecated"]
+ChunkStatus = Literal["active", "deprecated", "superseded"]
 
 MEMORY_TYPES: tuple[ChunkType, ...] = ("decision", "preference", "file_state", "constraint")
 

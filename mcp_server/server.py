@@ -135,11 +135,21 @@ _SERVER_INSTRUCTIONS = (
     "AUDIT: when the user reports a wrong answer, or when you act on a chunk naming a specific file/function/flag —\n"
     "  call list_chunks, verify stale entries, then cleanup_context to deprecate or merge.\n"
     "After editing a spec file: call reindex_specs so changes are immediately searchable.\n\n"
-    "GRAPH EDGES — declare relationships explicitly with add_edge when you know:\n"
-    "  - A decision SUPERSEDES an older one (don't just overwrite — preserve history)\n"
-    "  - One chunk DEPENDS_ON another (understanding A requires B)\n"
-    "  - Two chunks CONTRADICT each other (mutually exclusive decisions)\n"
-    "  RELATES_TO is auto-detected. The others require your judgment."
+    "GRAPH EDGES — required every time you call save_context:\n"
+    "  After every save_context call, immediately call add_edge for each relationship you know:\n"
+    "  - New chunk SUPERSEDES an older one on the same topic → add_edge(new_id, old_id, SUPERSEDES)\n"
+    "  - New chunk DEPENDS_ON another (can't be understood without it) → add_edge(new_id, dep_id, DEPENDS_ON)\n"
+    "  - New chunk CONTRADICTS an existing one (mutually exclusive) → add_edge(new_id, conflict_id, CONTRADICTS)\n"
+    "  - New chunk was DERIVED_FROM merging others → add_edge(new_id, source_id, DERIVED_FROM)\n"
+    "  Do not skip this step. No edges = no graph traversal = worse retrieval next session.\n"
+    "  RELATES_TO is auto-detected by embedding similarity — never declare it manually.\n"
+    "  Check the 'conflicts' field on query_context results — those are existing CONTRADICTS pairs to act on.\n\n"
+    "GRAPH RAG — query_context now uses graph traversal in addition to similarity:\n"
+    "  Phase 1: similarity seeds all chunks above 0.3 threshold.\n"
+    "  Phase 2: BFS from top-5 memory seeds over DEPENDS_ON, RELATES_TO, DERIVED_FROM, SUPERSEDES (depth ≤ 2).\n"
+    "  Phase 3: direct similarity hits override graph hits; type quotas applied; top results returned.\n"
+    "  Each result has 'retrieved_via': 'similarity' for direct hits, or a traversal path string for graph hits.\n"
+    "  Graph hits surface related chunks even when their query similarity is low — trust them."
 )
 
 app = Server("granum", instructions=_SERVER_INSTRUCTIONS)
@@ -502,6 +512,8 @@ async def _ipc_handler(method: str, params: dict):
         )
     if method == "get_all_edges":
         return db.get_all_edges(params["project_id"])
+    if method == "get_chunk_history":
+        return db.get_chunk_history(params["chunk_id"])
     if method == "list_chunks":
         chunks = db.get_all_memory_chunks(
             params["project_id"],

@@ -189,6 +189,12 @@ class GranumDB:
         )
         return self._row_to_chunk(res.get_next()) if res.has_next() else None
 
+    def _get_embedding(self, chunk_id: str) -> Optional[list[float]]:
+        res = self._conn.execute(
+            "MATCH (c:Chunk {id: $id}) RETURN c.embedding", {"id": chunk_id}
+        )
+        return res.get_next()[0] if res.has_next() else None
+
     def _exists(self, chunk_id: str) -> bool:
         res = self._conn.execute(
             "MATCH (c:Chunk {id: $id}) RETURN count(c)", {"id": chunk_id}
@@ -224,7 +230,7 @@ class GranumDB:
                     c.embedding  = $embedding,
                     c.updated_at = $updated_at,
                     c.deleted_at = $deleted_at
-            """, p)
+            """, {k: v for k, v in p.items() if k != "project_id" and k != "created_at"})
         else:
             self._conn.execute("""
                 CREATE (:Chunk {
@@ -527,6 +533,25 @@ class GranumDB:
         now = datetime.now(timezone.utc).isoformat()
 
         if existing:
+            # snapshot old version before overwriting
+            snap_id = f"{chunk_id}_v{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+            old_emb = self._get_embedding(chunk_id)
+            snap = Chunk(
+                id=snap_id,
+                project_id=existing.project_id,
+                title=existing.title,
+                content=existing.content,
+                type=existing.type,
+                importance=existing.importance,
+                status="superseded",
+                source=existing.source,
+                created_at=existing.created_at,
+                updated_at=existing.updated_at,
+                deleted_at="",
+            )
+            self._upsert_chunk(snap, old_emb)
+            self._add_edge(chunk_id, snap_id, "SUPERSEDES", 1.0, "versioning")
+
             existing.content = content
             existing.updated_at = now
             existing.importance = importance
@@ -603,6 +628,25 @@ class GranumDB:
             if len(chunk_ids) != 1:
                 raise ValueError("update requires exactly one chunk_id")
             cid = chunk_ids[0]
+            existing = self._get_by_id(cid)
+            if existing and merged_content:
+                snap_id = f"{cid}_v{int(datetime.now(timezone.utc).timestamp() * 1000)}"
+                old_emb = self._get_embedding(cid)
+                snap = Chunk(
+                    id=snap_id,
+                    project_id=existing.project_id,
+                    title=existing.title,
+                    content=existing.content,
+                    type=existing.type,
+                    importance=existing.importance,
+                    status="superseded",
+                    source=existing.source,
+                    created_at=existing.created_at,
+                    updated_at=existing.updated_at,
+                    deleted_at="",
+                )
+                self._upsert_chunk(snap, old_emb)
+                self._add_edge(cid, snap_id, "SUPERSEDES", 1.0, "versioning")
             params: dict = {"id": cid, "now": now}
             sets = ["c.updated_at = $now"]
             if merged_content:
@@ -623,6 +667,138 @@ class GranumDB:
     # query_context
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Graph RAG helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_all_chunks(self, project_id: str, include_spec: bool = True) -> list[dict]:
+        """Fetch all active chunks with embeddings for a project."""
+        conditions = "c.project_id = $pid AND c.status = 'active' AND c.deleted_at = ''"
+        if not include_spec:
+            conditions += " AND c.type <> 'spec'"
+        res = self._conn.execute(
+            f"""
+            MATCH (c:Chunk)
+            WHERE {conditions}
+            RETURN c.id, c.title, c.content, c.type, c.importance,
+                   c.status, c.source, c.updated_at, c.embedding
+            """,
+            {"pid": project_id},
+        )
+        rows = []
+        while res.has_next():
+            row = res.get_next()
+            rows.append({
+                "id": row[0], "title": row[1], "content": row[2],
+                "type": row[3], "importance": int(row[4] or 3),
+                "status": row[5], "source": row[6] or None,
+                "updated_at": row[7] or "", "embedding": row[8],
+            })
+        return rows
+
+    def _score_chunk(self, row: dict, sim: float, freshness_decay_days: int) -> dict:
+        importance = row["importance"]
+        updated_at = row["updated_at"]
+        is_spec = row["type"] == "spec"
+        freshness = _freshness_score(updated_at, freshness_decay_days)
+        base_score = sim if is_spec else (sim * 0.8 + freshness * 0.2)
+        final_score = base_score * 0.85 + (importance / 5) * 0.15
+
+        stale_warning = False
+        if not is_spec:
+            try:
+                then = datetime.fromisoformat(updated_at)
+                if then.tzinfo is None:
+                    then = then.replace(tzinfo=timezone.utc)
+                stale_warning = (datetime.now(timezone.utc) - then).days > self.stale_threshold_days
+            except Exception:
+                pass
+
+        return {
+            "id":           row["id"],
+            "title":        row["title"],
+            "content":      row["content"],
+            "type":         row["type"],
+            "source":       row["source"],
+            "importance":   importance,
+            "status":       row["status"],
+            "age":          _age_str(updated_at),
+            "stale_warning": stale_warning,
+            "similarity":   round(sim, 4),
+            "final_score":  round(final_score, 4),
+            "conflicts":    [] if is_spec else self._get_conflicts(row["id"]),
+            "retrieved_via": "similarity",
+        }
+
+    # Edge traversal weights: (decay per hop, bidirectional?)
+    _TRAVERSAL_EDGES = {
+        "DEPENDS_ON":   (0.78, False),  # outgoing only — dependency chain
+        "RELATES_TO":   (0.65, True),   # bidirectional — semantic cluster
+        "DERIVED_FROM": (0.72, False),  # outgoing — context lineage
+        "SUPERSEDES":   (0.60, False),  # outgoing — follow replacements
+    }
+    # CONTRADICTS intentionally excluded — contradicting chunks are noise, not signal
+
+    def _expand_graph(
+        self,
+        seed_ids: list[str],
+        seed_scores: dict[str, float],
+        chunk_map: dict[str, dict],
+        depth: int = 2,
+        min_score: float = 0.35,
+    ) -> dict[str, dict]:
+        """BFS from seed_ids over traversal edges. Returns {id: scored_chunk} for graph neighbors."""
+        visited = set(seed_ids)
+        frontier = [(cid, seed_scores[cid], [cid]) for cid in seed_ids]
+        graph_hits: dict[str, dict] = {}
+
+        for _depth in range(depth):
+            next_frontier = []
+            for src_id, src_score, path in frontier:
+                for et, (decay, bidirectional) in self._TRAVERSAL_EDGES.items():
+                    directions = ["outgoing"]
+                    if bidirectional:
+                        directions.append("incoming")
+                    for direction in directions:
+                        try:
+                            if direction == "outgoing":
+                                q = f"MATCH (a:Chunk {{id: $id}})-[r:{et}]->(b:Chunk) WHERE b.status = 'active' AND b.deleted_at = '' RETURN b.id, r.confidence"
+                            else:
+                                q = f"MATCH (b:Chunk)-[r:{et}]->(a:Chunk {{id: $id}}) WHERE b.status = 'active' AND b.deleted_at = '' RETURN b.id, r.confidence"
+                            res = self._conn.execute(q, {"id": src_id})
+                            while res.has_next():
+                                row = res.get_next()
+                                nbr_id, confidence = row[0], row[1]
+                                if nbr_id in visited:
+                                    continue
+                                visited.add(nbr_id)
+                                propagated = src_score * decay * (confidence or 1.0)
+                                if propagated < min_score:
+                                    continue
+                                nbr_row = chunk_map.get(nbr_id)
+                                if not nbr_row:
+                                    continue
+                                # depth decay: 0.72 per hop
+                                hop_decay = 0.72 ** (_depth + 1)
+                                graph_score = propagated * hop_decay
+                                via_path = path + [f"─{et}→", nbr_id]
+                                nbr_entry = self._score_chunk(nbr_row, graph_score, 90)
+                                nbr_entry["final_score"] = round(graph_score * 0.85 + (nbr_row["importance"] / 5) * 0.15, 4)
+                                nbr_entry["retrieved_via"] = " ".join(
+                                    [chunk_map[p]["title"] if p in chunk_map else p for p in via_path]
+                                )
+                                # keep best score if seen from multiple paths
+                                if nbr_id not in graph_hits or graph_hits[nbr_id]["final_score"] < nbr_entry["final_score"]:
+                                    graph_hits[nbr_id] = nbr_entry
+                                next_frontier.append((nbr_id, propagated, via_path))
+                        except Exception:
+                            pass
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        return graph_hits
+
     def query_context(
         self,
         project_id: str,
@@ -633,113 +809,71 @@ class GranumDB:
         freshness_decay_days: int = 90,
     ) -> list[dict]:
         query_emb = _embed(query)
-        results = []
 
-        memory_types = [t for t in (type_filter or list(MEMORY_TYPES)) if t != "spec"]
+        # ── Phase 1: similarity seeds (all chunks) ────────────────────────
+        all_chunks = self._fetch_all_chunks(project_id, include_spec=True)
+        chunk_map: dict[str, dict] = {c["id"]: c for c in all_chunks}
 
-        if memory_types:
-            type_list = "', '".join(memory_types)
-            res = self._conn.execute(
-                f"""
-                MATCH (c:Chunk)
-                WHERE c.project_id = $pid
-                  AND c.status = 'active'
-                  AND c.deleted_at = ''
-                  AND c.type IN ['{type_list}']
-                RETURN c.id, c.title, c.content, c.type, c.importance,
-                       c.status, c.source, c.updated_at, c.embedding
-                """,
-                {"pid": project_id},
-            )
+        memory_types = set(type_filter or list(MEMORY_TYPES)) - {"spec"}
+        want_spec = not type_filter or "spec" in type_filter
 
-            type_counts: dict[str, int] = {}
-            quota = max(3, memory_limit // 3)
-            scored = []
+        sim_hits: dict[str, dict] = {}   # id → scored chunk
+        seed_scores: dict[str, float] = {}
 
-            while res.has_next():
-                row = res.get_next()
-                emb = row[8]
-                if not emb:
-                    continue
-                sim = _dot(query_emb, emb)
-                if sim < 0.3:
-                    continue
+        for row in all_chunks:
+            if not row["embedding"]:
+                continue
+            is_spec = row["type"] == "spec"
+            if is_spec and not want_spec:
+                continue
+            if not is_spec and row["type"] not in memory_types:
+                continue
 
-                chunk_type = row[3]
-                if type_counts.get(chunk_type, 0) >= quota:
-                    continue
+            sim = _dot(query_emb, row["embedding"])
+            if sim < 0.3:
+                continue
 
-                importance  = int(row[4] or 3)
-                updated_at  = row[7] or ""
-                freshness   = _freshness_score(updated_at, freshness_decay_days)
-                base_score  = sim * 0.8 + freshness * 0.2
-                final_score = base_score * 0.85 + (importance / 5) * 0.15
+            scored = self._score_chunk(row, sim, freshness_decay_days)
+            sim_hits[row["id"]] = scored
+            seed_scores[row["id"]] = scored["final_score"]
 
-                stale_warning = False
-                try:
-                    then = datetime.fromisoformat(updated_at)
-                    if then.tzinfo is None:
-                        then = then.replace(tzinfo=timezone.utc)
-                    stale_warning = (datetime.now(timezone.utc) - then).days > self.stale_threshold_days
-                except Exception:
-                    pass
+        # ── Phase 2: graph expansion from top memory seeds ────────────────
+        top_seed_ids = [
+            cid for cid, _ in sorted(seed_scores.items(), key=lambda x: -x[1])
+            if chunk_map[cid]["type"] != "spec"
+        ][:5]
 
-                scored.append({
-                    "id":           row[0],
-                    "title":        row[1],
-                    "content":      row[2],
-                    "type":         chunk_type,
-                    "source":       row[6] or None,
-                    "importance":   importance,
-                    "status":       row[5],
-                    "age":          _age_str(updated_at),
-                    "stale_warning": stale_warning,
-                    "similarity":   round(sim, 4),
-                    "final_score":  round(final_score, 4),
-                    "conflicts":    self._get_conflicts(row[0]),
-                })
-                type_counts[chunk_type] = type_counts.get(chunk_type, 0) + 1
+        graph_hits = self._expand_graph(
+            top_seed_ids, seed_scores, chunk_map, depth=2, min_score=0.35
+        )
 
-            scored.sort(key=lambda x: x["final_score"], reverse=True)
-            results.extend(scored[:memory_limit])
+        # ── Phase 3: merge — direct similarity wins on id conflict ─────────
+        merged: dict[str, dict] = {**graph_hits, **sim_hits}  # sim_hits overrides
 
-        if not type_filter or "spec" in type_filter:
-            res = self._conn.execute(
-                """
-                MATCH (c:Chunk)
-                WHERE c.project_id = $pid AND c.type = 'spec' AND c.deleted_at = ''
-                RETURN c.id, c.title, c.content, c.source, c.importance,
-                       c.status, c.updated_at, c.embedding
-                """,
-                {"pid": project_id},
-            )
-            spec_scored = []
-            while res.has_next():
-                row = res.get_next()
-                emb = row[7]
-                if not emb:
-                    continue
-                sim = _dot(query_emb, emb)
-                if sim < 0.3:
-                    continue
-                spec_scored.append({
-                    "id":           row[0],
-                    "title":        row[1],
-                    "content":      row[2],
-                    "type":         "spec",
-                    "source":       row[3] or None,
-                    "importance":   int(row[4] or 3),
-                    "status":       row[5],
-                    "age":          _age_str(row[6] or ""),
-                    "stale_warning": False,
-                    "similarity":   round(sim, 4),
-                    "final_score":  round(sim, 4),
-                    "conflicts":    [],
-                })
-            spec_scored.sort(key=lambda x: x["final_score"], reverse=True)
-            results.extend(spec_scored[:spec_limit])
+        # ── Phase 4: quota + trim per pool ────────────────────────────────
+        quota = max(3, memory_limit // 3)
+        type_counts: dict[str, int] = {}
+        memory_results = []
 
-        results.sort(key=lambda x: x["final_score"], reverse=True)
+        for chunk in sorted(
+            (c for c in merged.values() if c["type"] != "spec"),
+            key=lambda x: -x["final_score"],
+        ):
+            ct = chunk["type"]
+            if type_counts.get(ct, 0) >= quota:
+                continue
+            memory_results.append(chunk)
+            type_counts[ct] = type_counts.get(ct, 0) + 1
+            if len(memory_results) >= memory_limit:
+                break
+
+        spec_results = sorted(
+            (c for c in merged.values() if c["type"] == "spec"),
+            key=lambda x: -x["final_score"],
+        )[:spec_limit]
+
+        results = memory_results + spec_results
+        results.sort(key=lambda x: -x["final_score"])
         return results
 
     def _get_conflicts(self, chunk_id: str) -> list[dict]:
@@ -759,6 +893,43 @@ class GranumDB:
             return out
         except Exception:
             return []
+
+    def get_chunk_history(self, chunk_id: str) -> list[dict]:
+        """Walk SUPERSEDES chain from chunk_id → older snapshots (chronological, newest first)."""
+        history = []
+        current = chunk_id
+        seen = {current}
+        while True:
+            try:
+                res = self._conn.execute(
+                    """
+                    MATCH (a:Chunk {id: $id})-[:SUPERSEDES]->(b:Chunk)
+                    RETURN b.id, b.title, b.content, b.type, b.importance,
+                           b.status, b.updated_at, b.created_at
+                    """,
+                    {"id": current},
+                )
+                if not res.has_next():
+                    break
+                row = res.get_next()
+                snap_id = row[0]
+                if snap_id in seen:
+                    break
+                seen.add(snap_id)
+                history.append({
+                    "id":         snap_id,
+                    "title":      row[1],
+                    "content":    row[2],
+                    "type":       row[3],
+                    "importance": int(row[4] or 3),
+                    "status":     row[5],
+                    "updated_at": row[6] or "",
+                    "created_at": row[7] or "",
+                })
+                current = snap_id
+            except Exception:
+                break
+        return history
 
     # ------------------------------------------------------------------
     # Edge queries (for CLI + get_related_chunks tool)
