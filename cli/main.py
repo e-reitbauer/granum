@@ -1503,6 +1503,124 @@ def clear(
     console.print(f"[{GREEN}]✓[/{GREEN}] Cleared [{ORANGE}]{len(chunks)}[/{ORANGE}] chunk(s)")
 
 
+@app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
+def drift(
+    project: Optional[str] = typer.Option(None, "--project"),
+    all_types: bool = typer.Option(False, "--all", "-a", help="Check all chunk types, not just file_state"),
+    threshold: int = typer.Option(60, "--days", help="Flag chunks older than N days as stale"),
+):
+    """Check for [bold]drifted or stale[/bold] memory chunks — verify stored facts against codebase."""
+    granum_dir = _find_granum_dir(Path(project) if project else None)
+    config = _load_config(granum_dir)
+    project_id = config["project_id"]
+    git_root = str(_git_root() or ".")
+
+    with _spinner("Checking chunks against codebase") as _status:
+        db = _get_db(config, granum_dir)
+        types = None if all_types else ["file_state"]
+        results = db.check_drift(project_id, git_root, age_threshold_days=threshold, types=types)
+
+    if not results:
+        label = "chunks" if all_types else "file_state chunks"
+        console.print(f"[{MUTED}]· No {label} to check[/{MUTED}]")
+        return
+
+    flagged = [r for r in results if r["verdict"] in ("drifted", "stale")]
+    clean   = [r for r in results if r["verdict"] == "ok"]
+
+    proj = Path(git_root).name
+    console.print(f"\n  [{ORANGE}]{proj}[/{ORANGE}]  [{MUTED}]·  {len(results)} chunk(s) checked[/{MUTED}]\n")
+
+    if flagged:
+        console.print(f"  [{RED}]⚠ potentially drifted ({len(flagged)})[/{RED}]\n")
+        for r in flagged:
+            icon = TYPE_ICONS.get(r["type"], "·")
+            score_str = f"{r['score']:.0%}" if r["score"] is not None else "no terms"
+            flags = []
+            if r["age_days"] > threshold:
+                flags.append(f"[{AMBER}]{r['age_days']}d old[/{AMBER}]")
+            if r["score"] is not None and r["score"] < 0.6:
+                flags.append(f"[{RED}]{score_str} verified[/{RED}]")
+            flag_str = "  " + "  ".join(flags) if flags else ""
+            console.print(f"  [{MUTED}]{r['id'][:8]}[/{MUTED}] [{ORANGE}]{icon} {r['title'][:50]}[/{ORANGE}]{flag_str}")
+            if r["missing_paths"]:
+                console.print(f"    [{GRAY}]missing paths: {', '.join(r['missing_paths'][:3])}[/{GRAY}]")
+            if r["missing_idents"]:
+                console.print(f"    [{GRAY}]unverified: {', '.join(r['missing_idents'][:4])}[/{GRAY}]")
+        console.print()
+
+    if clean:
+        console.print(f"  [{GREEN}]✓ verified ({len(clean)})[/{GREEN}]")
+        for r in clean:
+            score_str = f"{r['score']:.0%}" if r["score"] is not None else "—"
+            console.print(f"    [{MUTED}]{r['id'][:8]}[/{MUTED}] [{BODY}]{r['title'][:50]}[/{BODY}]  [{MUTED}]{score_str}[/{MUTED}]")
+        console.print()
+
+    if not flagged:
+        console.print(f"  [{GREEN}]✓ all chunks verified against codebase[/{GREEN}]\n")
+
+
+@app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
+def summarize(
+    project: Optional[str] = typer.Option(None, "--project"),
+    hours: int = typer.Option(24, "--hours", "-h", help="Look back N hours"),
+    save: bool = typer.Option(False, "--save", "-s", help="Store summary as a handoff chunk"),
+):
+    """Show [bold]recent memory changes[/bold] as a session handoff narrative."""
+    granum_dir = _find_granum_dir(Path(project) if project else None)
+    config = _load_config(granum_dir)
+    project_id = config["project_id"]
+
+    with _spinner(f"Loading changes in last {hours}h") as status:
+        db = _get_db(config, granum_dir)
+        chunks = db.get_recent_changes(project_id, since_hours=hours)
+
+    if not chunks:
+        console.print(f"[{MUTED}]· No memory changes in the last {hours}h[/{MUTED}]")
+        return
+
+    # Group by type
+    by_type: dict[str, list] = {}
+    for c in chunks:
+        by_type.setdefault(c.type, []).append(c)
+
+    proj = Path(_git_root() or ".").name
+    console.print(f"\n  [{ORANGE}]{proj}[/{ORANGE}]  [{MUTED}]·  last {hours}h  ·  {len(chunks)} change(s)[/{MUTED}]\n")
+
+    type_order = ["decision", "constraint", "file_state", "preference"]
+    for t in type_order:
+        group = by_type.get(t, [])
+        if not group:
+            continue
+        icon = TYPE_ICONS.get(t, "·")
+        color = TYPE_COLORS.get(t, ORANGE)
+        console.print(f"  [{color}]{icon} {t}[/{color}]  [{MUTED}]({len(group)})[/{MUTED}]")
+        for c in group:
+            age = _age_str(_age_seconds(c.updated_at))
+            imp_str = f" [{MUTED}]imp {c.importance}[/{MUTED}]" if c.importance != 3 else ""
+            console.print(f"    [{BODY}]{c.title[:60]}[/{BODY}]  [{MUTED}]{age}[/{MUTED}]{imp_str}")
+        console.print()
+
+    if save:
+        # Build narrative from chunk titles grouped by type
+        parts = []
+        for t in type_order:
+            group = by_type.get(t, [])
+            if not group:
+                continue
+            titles = ", ".join(f'"{c.title}"' for c in group[:3])
+            suffix = f" (and {len(group)-3} more)" if len(group) > 3 else ""
+            parts.append(f"{t}: {titles}{suffix}")
+        narrative = ". ".join(parts) + "."
+
+        with _spinner("Saving handoff chunk") as status:
+            db.save_handoff(project_id, narrative)
+            db.export_ndjson(project_id)
+        console.print(f"[{GREEN}]✓[/{GREEN}] Handoff saved as preference chunk")
+    else:
+        console.print(f"  [{MUTED}]· run with --save to store as a handoff chunk for next session[/{MUTED}]")
+
+
 @app.command("export", rich_help_panel="[bold #4ade80]Data[/bold #4ade80]")
 def export_cmd(project: Optional[str] = typer.Option(None, "--project")):
     """Export chunks to [bold].granum/chunks.ndjson[/bold]."""

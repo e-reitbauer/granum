@@ -280,8 +280,9 @@ class GranumDB:
             {"a": from_id, "b": to_id, "conf": confidence, "by": created_by, "at": now},
         )
 
-    def _auto_detect_edges(self, chunk: Chunk, embedding: list[float]) -> None:
-        """Detect CONTRADICTS / RELATES_TO edges after saving a chunk."""
+    def _auto_detect_edges(self, chunk: Chunk, embedding: list[float]) -> list[dict]:
+        """Detect CONTRADICTS / RELATES_TO edges after saving a chunk.
+        Returns list of {id, title, sim} for newly created CONTRADICTS pairs."""
         res = self._conn.execute(
             """
             MATCH (c:Chunk)
@@ -301,6 +302,7 @@ class GranumDB:
                 candidates.append({"id": row[0], "title": row[1], "type": row[2], "sim": sim})
 
         candidates.sort(key=lambda x: x["sim"], reverse=True)
+        new_conflicts: list[dict] = []
         for c in candidates[:10]:
             sim = c["sim"]
             cross_type = (chunk.type == "spec") != (c["type"] == "spec")
@@ -309,8 +311,10 @@ class GranumDB:
             if sim >= 0.88 and _is_contradicting(chunk.title, c["title"]):
                 self._add_edge(chunk.id, c["id"], "CONTRADICTS", sim, "auto")
                 self._add_edge(c["id"], chunk.id, "CONTRADICTS", sim, "auto")
+                new_conflicts.append({"id": c["id"], "title": c["title"], "sim": round(sim, 4)})
             elif sim >= relates_threshold and not self._edge_exists(chunk.id, c["id"], "CONTRADICTS"):
                 self._add_edge(chunk.id, c["id"], "RELATES_TO", sim, "auto")
+        return new_conflicts
 
     def add_edge(
         self,
@@ -609,7 +613,7 @@ class GranumDB:
             self._upsert_chunk(chunk, embedding)
             action = "created"
 
-        self._auto_detect_edges(
+        new_conflicts = self._auto_detect_edges(
             Chunk(
                 id=chunk_id, project_id=project_id, title=title,
                 content=content, type=chunk_type, importance=importance,
@@ -637,6 +641,8 @@ class GranumDB:
             pass
 
         result = {"action": action, "id": chunk_id}
+        if new_conflicts:
+            result["new_conflicts"] = new_conflicts
         if merge_candidates:
             result["merge_candidates"] = merge_candidates
         return result
@@ -1286,6 +1292,130 @@ class GranumDB:
     def get_all_chunks_with_embeddings(self, project_id: str) -> list[dict]:
         """Return all active chunks (memory + spec) with their raw embedding vectors."""
         return self._fetch_all_chunks(project_id, include_spec=True)
+
+    def get_recent_changes(self, project_id: str, since_hours: int = 24) -> list[Chunk]:
+        """Return memory chunks updated within the last since_hours hours, newest first."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
+        type_list = "', '".join(MEMORY_TYPES)
+        res = self._conn.execute(
+            f"""
+            MATCH (c:Chunk)
+            WHERE c.project_id = $pid
+              AND c.type IN ['{type_list}']
+              AND c.status IN ['active', 'deprecated']
+              AND c.deleted_at = ''
+              AND c.updated_at >= $cutoff
+            RETURN {self._CHUNK_RETURN}
+            """,
+            {"pid": project_id, "cutoff": cutoff},
+        )
+        chunks = []
+        while res.has_next():
+            chunks.append(self._row_to_chunk(res.get_next()))
+        chunks.sort(key=lambda c: c.updated_at, reverse=True)
+        return chunks
+
+    def check_drift(
+        self,
+        project_id: str,
+        git_root: str,
+        age_threshold_days: int = 60,
+        types: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """Check memory chunks for drift vs codebase. Returns list of result dicts sorted worst-first."""
+        import re
+        import subprocess as _sp
+
+        if types:
+            chunks = [c for c in self.get_all_memory_chunks(project_id) if c.type in types]
+        else:
+            chunks = [c for c in self.get_all_memory_chunks(project_id) if c.type == "file_state"]
+
+        _path_re  = re.compile(r'\b[\w.\-]+/[\w./\-]+\b')
+        _ident_re = re.compile(r'\b([a-z][a-z0-9_]{4,}|[A-Z][a-zA-Z0-9]{4,}|[a-z]+\.[a-z][a-z0-9_.]{3,})\b')
+        _ext      = ("py", "ts", "js", "tsx", "jsx", "go", "rs", "java", "rb", "cs")
+        _noise    = {"about", "after", "before", "between", "every", "should", "which",
+                     "their", "there", "these", "those", "where", "while", "would", "could",
+                     "always", "never", "other", "since", "until", "using", "based"}
+
+        def _grep(term: str) -> bool:
+            includes = " ".join(f"--include='*.{e}'" for e in _ext)
+            try:
+                r = _sp.run(
+                    f"grep -r -l --quiet {_sp.list2cmdline([term])} {includes} .",
+                    shell=True, cwd=git_root, capture_output=True, timeout=5,
+                )
+                return r.returncode == 0
+            except Exception:
+                return True
+
+        def _extract(chunk: Chunk) -> tuple[list[str], list[str]]:
+            text = f"{chunk.title} {chunk.content}"
+            paths  = list(dict.fromkeys(_path_re.findall(text)))[:5]
+            idents = [i for i in dict.fromkeys(_ident_re.findall(text)) if i.lower() not in _noise][:5]
+            return paths, idents
+
+        def _age_days(updated_at: str) -> int:
+            try:
+                then = datetime.fromisoformat(updated_at)
+                if then.tzinfo is None:
+                    then = then.replace(tzinfo=timezone.utc)
+                return max(0, (datetime.now(timezone.utc) - then).days)
+            except Exception:
+                return 0
+
+        results = []
+        for chunk in chunks:
+            paths, idents = _extract(chunk)
+            groot = Path(git_root)
+            missing_paths = [p for p in paths if not (groot / p).exists()]
+            found_paths   = [p for p in paths if     (groot / p).exists()]
+            missing_idents = [i for i in idents if not _grep(i)]
+            found_idents   = [i for i in idents if     _grep(i)]
+
+            total = len(paths) + len(idents)
+            found = len(found_paths) + len(found_idents)
+            score = round(found / total, 3) if total > 0 else None
+            age   = _age_days(chunk.updated_at)
+
+            if (score is not None and score < 0.6) or age > age_threshold_days:
+                verdict = "drifted"
+            elif age > age_threshold_days // 2:
+                verdict = "stale"
+            else:
+                verdict = "ok"
+
+            results.append({
+                "id":             chunk.id,
+                "title":          chunk.title,
+                "type":           chunk.type,
+                "importance":     chunk.importance,
+                "age_days":       age,
+                "score":          score,
+                "missing_paths":  missing_paths,
+                "missing_idents": missing_idents,
+                "verdict":        verdict,
+            })
+
+        results.sort(key=lambda r: (
+            {"drifted": 0, "stale": 1, "ok": 2}[r["verdict"]],
+            r["score"] if r["score"] is not None else 0.5,
+            -r["age_days"],
+        ))
+        return results
+
+    def save_handoff(self, project_id: str, summary: str) -> dict:
+        """Store a session handoff note as a preference chunk for cold-start injection."""
+        from datetime import date
+        title = f"session handoff {date.today().isoformat()}"
+        return self.save_context(
+            project_id=project_id,
+            title=title,
+            content=summary,
+            chunk_type="preference",
+            importance=4,
+        )
 
     def reembed_all(self, project_id: str) -> int:
         chunks = self.get_all_memory_chunks(project_id, include_deprecated=True)

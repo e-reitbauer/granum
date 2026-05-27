@@ -94,11 +94,18 @@ except Exception as e:
 _SERVER_INSTRUCTIONS = (
     "Granum is your persistent memory layer. Follow this protocol strictly.\n\n"
 
-    "BEFORE any other action each turn:\n"
+    "SESSION START — once per session, in this order:\n"
+    "  1. query_context with the user's first message.\n"
+    "     Returns {\"chunks\": [...], \"unresolved_conflicts\": [...]}.\n"
+    "     If unresolved_conflicts non-empty: resolve FIRST via cleanup_context or add_edge(CONTRADICTS).\n"
+    "  2. check_drift (file_state chunks, default). If any chunks rated 'drifted':\n"
+    "     verify the missing terms yourself, then call cleanup_context(update) or cleanup_context(deprecate).\n"
+    "     Do NOT silently use a drifted chunk — stale facts compound across sessions.\n"
+    "  3. get_recent_changes(hours=24) if the user asks 'what did we do last session' or similar,\n"
+    "     OR if the first prompt suggests continuing previous work. Skip otherwise.\n"
+    "  Do NOT call check_drift or get_recent_changes every turn — session start only.\n\n"
+    "BEFORE any other action EACH TURN:\n"
     "  Call query_context with the user's message to retrieve relevant memory.\n"
-    "  query_context returns {\"chunks\": [...], \"unresolved_conflicts\": [...]}.\n"
-    "  If unresolved_conflicts is non-empty: resolve them FIRST before answering — call add_edge(CONTRADICTS)\n"
-    "  to confirm, or cleanup_context(deprecate/merge) to resolve. Do not ignore conflicts.\n"
     "  Before acting on any retrieved chunk naming a specific file/function/flag —\n"
     "  verify it still exists in the codebase first. If not, update or deprecate before proceeding.\n\n"
     "ANYTIME mid-turn you are about to make an assumption about the project — check first:\n"
@@ -153,11 +160,18 @@ _SERVER_INSTRUCTIONS = (
     "  Phase 3: direct similarity hits override graph hits; type quotas applied; top results returned.\n"
     "  Each chunk has 'retrieved_via': 'similarity' for direct hits, or a traversal path string for graph hits.\n"
     "  Graph hits surface related chunks even when their query similarity is low — trust them.\n\n"
-    "AFTER save_context: check the response for 'merge_candidates'.\n"
-    "  If present, these are active chunks with cosine similarity ≥ 0.85 to the one you just saved.\n"
-    "  Strong signal they cover the same topic. Consider calling cleanup_context(merge) to consolidate.\n"
-    "  Each chunk also has 'retrieval_count' — how many times it has been retrieved. High count + low\n"
-    "  importance = consider bumping importance. Zero count after many sessions = candidate for cleanup."
+    "AFTER save_context: check the response for:\n"
+    "  'new_conflicts' — CONTRADICTS edges were auto-detected. Resolve immediately: call cleanup_context\n"
+    "    (merge or deprecate) or add_edge(CONTRADICTS) to confirm. Do not leave unresolved.\n"
+    "  'merge_candidates' — active chunks with cosine similarity ≥ 0.85. Same topic, consider merging.\n"
+    "  Each chunk also has 'retrieval_count'. High count + low importance = bump importance.\n"
+    "  Zero count after many sessions = candidate for cleanup.\n\n"
+    "SESSION HANDOFF — at end of every session (user says done/goodbye/thanks, or task is complete):\n"
+    "  Call save_handoff with a 2-3 sentence summary: key decisions made, files changed, open questions.\n"
+    "  This is injected at the next cold start so future sessions don't lose context from this one.\n"
+    "  Example: 'Switched auth from JWT to sessions (constraint: GDPR). Refactored user module into\n"
+    "  three files. Open: whether to add refresh token rotation.'\n"
+    "  Be specific — vague handoffs are useless. If nothing happened worth saving, skip it."
 )
 
 app = Server("granum", instructions=_SERVER_INSTRUCTIONS)
@@ -320,6 +334,59 @@ async def list_tools() -> list[Tool]:
                 "required": ["chunk_id"],
             },
         ),
+        Tool(
+            name="save_handoff",
+            description=(
+                "Save a session handoff note for the next cold start. "
+                "Call at end of every productive session with a 2-3 sentence summary: "
+                "key decisions made, files changed, open questions. "
+                "Injected first at next session start so future sessions retain context."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "2-3 sentences: decisions made, files changed, open questions"},
+                },
+                "required": ["summary"],
+            },
+        ),
+        Tool(
+            name="check_drift",
+            description=(
+                "Check memory chunks against the codebase for drift — files that moved, "
+                "identifiers that were renamed, or facts that are simply old. "
+                "Returns chunks rated 'drifted', 'stale', or 'ok' with specific missing paths/terms. "
+                "Call at session start (once per session, not every turn) to surface stale facts "
+                "before acting on them. For drifted chunks: update or deprecate via cleanup_context."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["decision", "preference", "file_state", "constraint"]},
+                        "description": "Chunk types to check (default: file_state only)",
+                    },
+                    "age_threshold_days": {
+                        "type": "integer",
+                        "description": "Flag chunks older than this many days as stale (default 60)",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="get_recent_changes",
+            description=(
+                "Return memory chunks updated in the last N hours, newest first. "
+                "Use to orient at session start, build a handoff, or see what changed since last time."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "integer", "description": "Look-back window in hours (default 24)"},
+                },
+            },
+        ),
     ]
 
 
@@ -403,6 +470,44 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 depth=arguments.get("depth", 1),
             )
             return [TextContent(type="text", text=json.dumps(edges, indent=2))]
+
+        elif name == "save_handoff":
+            result = db.save_handoff(
+                project_id=project_id,
+                summary=arguments["summary"],
+            )
+            db.export_ndjson(project_id)
+            return [TextContent(type="text", text=json.dumps(result))]
+
+        elif name == "check_drift":
+            import subprocess as _sp
+            cwd = Path(os.environ.get("GRANUM_CWD", os.getcwd()))
+            try:
+                git_root = _sp.run(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    cwd=str(cwd), capture_output=True, text=True, timeout=3,
+                ).stdout.strip() or str(cwd)
+            except Exception:
+                git_root = str(cwd)
+            results = db.check_drift(
+                project_id=project_id,
+                git_root=git_root,
+                age_threshold_days=arguments.get("age_threshold_days", 60),
+                types=arguments.get("types"),
+            )
+            return [TextContent(type="text", text=json.dumps(results, indent=2))]
+
+        elif name == "get_recent_changes":
+            chunks = db.get_recent_changes(
+                project_id=project_id,
+                since_hours=arguments.get("hours", 24),
+            )
+            result = [
+                {"id": c.id, "type": c.type, "title": c.title,
+                 "importance": c.importance, "status": c.status, "updated_at": c.updated_at}
+                for c in chunks
+            ]
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         else:
             return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
