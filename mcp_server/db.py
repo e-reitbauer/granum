@@ -1283,6 +1283,10 @@ class GranumDB:
             chunks.append(self._row_to_chunk(res.get_next()))
         return chunks
 
+    def get_all_chunks_with_embeddings(self, project_id: str) -> list[dict]:
+        """Return all active chunks (memory + spec) with their raw embedding vectors."""
+        return self._fetch_all_chunks(project_id, include_spec=True)
+
     def reembed_all(self, project_id: str) -> int:
         chunks = self.get_all_memory_chunks(project_id, include_deprecated=True)
         for chunk in chunks:

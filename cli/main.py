@@ -1020,6 +1020,227 @@ window.addEventListener('resize', () => {{
 </html>"""
 
 
+def _pca_2d(embeddings: list[list[float]]) -> list[tuple[float, float]]:
+    import numpy as np
+    X = np.array(embeddings, dtype=np.float32)
+    X -= X.mean(axis=0)
+    _, _, Vt = np.linalg.svd(X, full_matrices=False)
+    coords = X @ Vt[:2].T
+    for i in range(2):
+        lo, hi = coords[:, i].min(), coords[:, i].max()
+        r = hi - lo
+        coords[:, i] = (coords[:, i] - lo) / r * 2 - 1 if r > 0 else coords[:, i]
+    return [(float(x), float(y)) for x, y in coords]
+
+
+def _build_embed_html(chunks_with_xy, edges: list[dict], git_root: Optional[str], branch: str) -> str:
+    import json as _json
+
+    proj = Path(git_root or ".").name
+    type_colors = {
+        "decision":   "#88c9a0",
+        "constraint": "#d4b483",
+        "preference": "#a8d4b5",
+        "file_state": "#8bbfa8",
+        "spec":       "#4a7a5e",
+    }
+    edge_colors = {
+        "CONTRADICTS":  "#d47f7f",
+        "SUPERSEDES":   "#d4b483",
+        "RELATES_TO":   "#88c9a0",
+        "DERIVED_FROM": "#6abf85",
+        "DEPENDS_ON":   "#a8d4b5",
+    }
+    edge_dash = {"CONTRADICTS": "6,3", "SUPERSEDES": "4,2"}
+
+    nodes = [
+        {
+            "id":         c["id"],
+            "label":      c["title"][:36] + ("…" if len(c["title"]) > 36 else ""),
+            "fullTitle":  c["title"],
+            "content":    c["content"][:120] + ("…" if len(c["content"]) > 120 else ""),
+            "type":       c["type"],
+            "importance": c["importance"],
+            "retrieval_count": c.get("retrieval_count", 0),
+            "color":      type_colors.get(c["type"], "#6b7280"),
+            "px":         c["px"],
+            "py":         c["py"],
+        }
+        for c in chunks_with_xy
+    ]
+    node_ids = {n["id"] for n in nodes}
+    links = [
+        {
+            "source": e["from_id"],
+            "target": e["to_id"],
+            "type":   e["edge_type"],
+            "color":  edge_colors.get(e["edge_type"], "#6b7280"),
+            "dash":   edge_dash.get(e["edge_type"], "0"),
+        }
+        for e in edges
+        if e["from_id"] in node_ids and e["to_id"] in node_ids
+    ]
+    data_json   = _json.dumps({"nodes": nodes, "links": links})
+    legend_json = _json.dumps([{"label": k, "color": v} for k, v in type_colors.items()])
+    edge_leg    = _json.dumps([{"label": k, "color": v, "dash": edge_dash.get(k, "0")} for k, v in edge_colors.items()])
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Granum embed — {proj} ({branch})</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ background:#0f0f0f; color:#e5e5e5; font-family:monospace; overflow:hidden; }}
+#graph {{ width:100vw; height:100vh; }}
+.node circle {{ stroke-width:1.5px; cursor:pointer; transition:r .15s; }}
+.node circle:hover {{ stroke:#fff !important; stroke-width:2px; }}
+.node text {{ font-size:10px; fill:#d4ead9; pointer-events:none; }}
+.link {{ stroke-opacity:.5; fill:none; }}
+#axes line {{ stroke:#222; stroke-width:1px; }}
+#axes text {{ fill:#4a7a5e; font-size:10px; font-family:monospace; }}
+#tooltip {{
+  position:fixed; background:#1a1a1a; border:1px solid #2a2a2a;
+  padding:10px 14px; border-radius:6px; font-size:12px; line-height:1.7;
+  pointer-events:none; opacity:0; transition:opacity .15s;
+  max-width:320px; z-index:10;
+}}
+#legend {{
+  position:fixed; bottom:20px; left:20px; background:#111;
+  border:1px solid #1e1e1e; border-radius:6px; padding:12px 16px; font-size:11px;
+}}
+#legend h4 {{ color:#88c9a0; margin-bottom:5px; font-size:10px; letter-spacing:.08em; }}
+.leg-row {{ display:flex; align-items:center; gap:7px; margin:3px 0; color:#6b7280; }}
+.leg-dot {{ width:9px; height:9px; border-radius:50%; flex-shrink:0; }}
+.leg-line {{ width:18px; height:2px; flex-shrink:0; }}
+#info {{
+  position:fixed; top:16px; left:50%; transform:translateX(-50%);
+  color:#4a7a5e; font-size:11px; letter-spacing:.06em;
+}}
+#subtitle {{
+  position:fixed; top:34px; left:50%; transform:translateX(-50%);
+  color:#2d5a3d; font-size:10px; letter-spacing:.05em;
+}}
+</style>
+</head>
+<body>
+<svg id="graph"></svg>
+<div id="tooltip"></div>
+<div id="legend">
+  <h4>CHUNK TYPE</h4>
+  <div id="node-legend"></div>
+  <h4 style="margin-top:9px">EDGE TYPE</h4>
+  <div id="edge-legend"></div>
+</div>
+<div id="info">{proj} &nbsp;·&nbsp; {branch} &nbsp;·&nbsp; {len(nodes)} chunks</div>
+<div id="subtitle">PCA projection — semantic proximity</div>
+<script>
+const data = {data_json};
+const legendItems = {legend_json};
+const edgeLegend = {edge_leg};
+
+legendItems.forEach(d => {{
+  const row = document.createElement('div');
+  row.className = 'leg-row';
+  row.innerHTML = `<div class="leg-dot" style="background:${{d.color}}"></div><span>${{d.label}}</span>`;
+  document.getElementById('node-legend').appendChild(row);
+}});
+edgeLegend.forEach(d => {{
+  const row = document.createElement('div');
+  row.className = 'leg-row';
+  const svg = `<svg width="18" height="10"><line x1="0" y1="5" x2="18" y2="5"
+    stroke="${{d.color}}" stroke-width="2" stroke-dasharray="${{d.dash}}"/></svg>`;
+  row.innerHTML = svg + `<span>${{d.label}}</span>`;
+  document.getElementById('edge-legend').appendChild(row);
+}});
+
+const W = window.innerWidth, H = window.innerHeight;
+const PAD = 80;
+const xScale = d3.scaleLinear().domain([-1,1]).range([PAD, W-PAD]);
+const yScale = d3.scaleLinear().domain([-1,1]).range([H-PAD, PAD]);
+
+const svg = d3.select('#graph');
+const tooltip = document.getElementById('tooltip');
+
+const g = svg.append('g');
+svg.call(d3.zoom().scaleExtent([.2,12]).on('zoom', e => g.attr('transform', e.transform)));
+
+// Axes
+const ax = g.append('g').attr('id','axes');
+ax.append('line').attr('x1', xScale(-1)).attr('x2', xScale(1))
+  .attr('y1', yScale(0)).attr('y2', yScale(0));
+ax.append('line').attr('y1', yScale(-1)).attr('y2', yScale(1))
+  .attr('x1', xScale(0)).attr('x2', xScale(0));
+ax.append('text').attr('x', xScale(1)+4).attr('y', yScale(0)+4).text('PC1');
+ax.append('text').attr('x', xScale(0)+4).attr('y', yScale(1)-6).text('PC2');
+
+// Arrow markers
+const defs = svg.append('defs');
+{_json.dumps(list(edge_colors.keys()))}.forEach(type => {{
+  const color = {_json.dumps(edge_colors)}[type];
+  defs.append('marker')
+    .attr('id','arrow-'+type)
+    .attr('viewBox','0 -4 8 8').attr('refX',16).attr('markerWidth',5).attr('markerHeight',5)
+    .attr('orient','auto')
+    .append('path').attr('d','M0,-4L8,0L0,4').attr('fill',color).attr('opacity',.6);
+}});
+
+// Position nodes from PCA coords
+data.nodes.forEach(d => {{
+  d.x = xScale(d.px);
+  d.y = yScale(d.py);
+}});
+
+const nodeById = Object.fromEntries(data.nodes.map(d => [d.id, d]));
+
+// Edges as straight lines between PCA positions
+const link = g.append('g').selectAll('line')
+  .data(data.links).join('line')
+  .attr('class','link')
+  .attr('stroke', d => d.color)
+  .attr('stroke-width', 1.2)
+  .attr('stroke-dasharray', d => d.dash)
+  .attr('marker-end', d => `url(#arrow-${{d.type}})`)
+  .attr('x1', d => nodeById[d.source]?.x ?? 0)
+  .attr('y1', d => nodeById[d.source]?.y ?? 0)
+  .attr('x2', d => nodeById[d.target]?.x ?? 0)
+  .attr('y2', d => nodeById[d.target]?.y ?? 0);
+
+// Nodes
+const node = g.append('g').selectAll('g')
+  .data(data.nodes).join('g')
+  .attr('class','node')
+  .attr('transform', d => `translate(${{d.x}},${{d.y}})`);
+
+node.append('circle')
+  .attr('r', d => 4 + d.importance * 1.4)
+  .attr('fill', d => d.color + (d.type === 'spec' ? '44' : 'bb'))
+  .attr('stroke', d => d.color);
+
+node.append('text')
+  .attr('dy', d => 7 + d.importance * 1.4)
+  .attr('text-anchor','middle')
+  .text(d => d.label);
+
+node.on('mouseover', (e, d) => {{
+  tooltip.style.opacity = 1;
+  tooltip.style.left = (e.clientX + 14) + 'px';
+  tooltip.style.top  = (e.clientY - 10) + 'px';
+  tooltip.innerHTML =
+    `<div style="color:${{d.color}};font-weight:bold;margin-bottom:4px">${{d.fullTitle}}</div>` +
+    `<div style="color:#a8d4b5;margin-bottom:6px">${{d.content}}</div>` +
+    `<div style="color:#6b7280">${{d.type}} &nbsp;·&nbsp; imp ${{d.importance}} &nbsp;·&nbsp; retrieved ${{d.retrieval_count}}×</div>` +
+    `<div style="color:#4a7a5e;font-size:10px;margin-top:3px">${{d.id.slice(0,12)}}</div>`;
+}}).on('mousemove', e => {{
+  tooltip.style.left = (e.clientX + 14) + 'px';
+  tooltip.style.top  = (e.clientY - 10) + 'px';
+}}).on('mouseout', () => {{ tooltip.style.opacity = 0; }});
+</script>
+</body>
+</html>"""
+
+
 _EDGE_COLORS = {
     "CONTRADICTS":  RED,
     "SUPERSEDES":   AMBER,
@@ -1058,11 +1279,37 @@ def graph(
     project: Optional[str] = typer.Option(None, "--project"),
     depth: int = typer.Option(1, "--depth", "-d", help="Hop depth for centered view (1 or 2)"),
     open_browser: bool = typer.Option(False, "--open", "-o", help="Open interactive D3 graph in browser"),
+    embed: bool = typer.Option(False, "--embed", "-e", help="Open PCA vector-space scatter plot in browser"),
 ):
     """Visualize memory [bold]relationship graph[/bold]. --open for Obsidian-style browser view."""
     granum_dir = _find_granum_dir(Path(project) if project else None)
     config = _load_config(granum_dir)
     project_id = config["project_id"]
+
+    if embed:
+        with _spinner("Loading chunks and embeddings") as status:
+            db = _get_db(config, granum_dir)
+            rows = db.get_all_chunks_with_embeddings(project_id)
+            rows = [r for r in rows if r.get("embedding")]
+            status.update(f"Computing PCA  {len(rows)} chunks")
+            embeddings = [r["embedding"] for r in rows]
+            if len(embeddings) < 2:
+                console.print(f"[{AMBER}]⚠ Need at least 2 chunks with embeddings for PCA[/{AMBER}]")
+                return
+            coords = _pca_2d(embeddings)
+            chunks_with_xy = [
+                {**r, "px": coords[i][0], "py": coords[i][1]}
+                for i, r in enumerate(rows)
+            ]
+            status.update("Loading graph edges")
+            edges = db.get_all_edges(project_id)
+        html_path = granum_dir / "embed.html"
+        html = _build_embed_html(chunks_with_xy, edges or [], _git_root(), _git_branch())
+        html_path.write_text(html)
+        import webbrowser
+        webbrowser.open(f"file://{html_path.resolve()}")
+        console.print(f"[{GREEN}]✓[/{GREEN}] Opened [{ORANGE}]{html_path}[/{ORANGE}]")
+        return
 
     if open_browser:
         with _spinner("Loading memory chunks") as status:
