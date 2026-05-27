@@ -306,6 +306,14 @@ def _kv_table() -> Table:
     return t
 
 
+def _hdr(*parts: str) -> None:
+    """Print graph-style header: proj  branch  ·  parts..."""
+    proj = Path(_git_root() or ".").name
+    branch = _git_branch()
+    suffix = f"  [{MUTED}]·  {'  ·  '.join(parts)}[/{MUTED}]" if parts else ""
+    console.print(f"\n  [{ORANGE}]{proj}[/{ORANGE}]  [{MUTED}]{branch}[/{MUTED}]{suffix}\n")
+
+
 # ------------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------------
@@ -474,19 +482,41 @@ def list_cmd(
         console.print(f"[{MUTED}]· No chunks found[/{MUTED}]")
         return
 
-    console.print(_context_panel(len(chunks), len(spec_chunks)))
+    parts = []
+    if chunks:     parts.append(f"{len(chunks)} chunk{'s' if len(chunks) != 1 else ''}")
+    if spec_chunks: parts.append(f"{len(spec_chunks)} spec{'s' if len(spec_chunks) != 1 else ''}")
+    _hdr(*parts)
 
-    if chunks:
-        table = _make_chunk_table()
-        for chunk in chunks:
-            _add_chunk_row(table, chunk, stale_threshold)
-        console.print(_table_panel(table, f"memory  {len(chunks)}"))
+    type_order = ["decision", "constraint", "preference", "file_state"]
+    by_type: dict[str, list] = {}
+    for c in chunks:
+        by_type.setdefault(c.type, []).append(c)
+
+    for t in type_order:
+        group = by_type.get(t, [])
+        if not group:
+            continue
+        icon = TYPE_ICONS.get(t, "·")
+        color = TYPE_COLORS.get(t, ORANGE)
+        console.print(f"  [{color}]{icon} {t}[/{color}]  [{MUTED}]({len(group)})[/{MUTED}]")
+        for c in group:
+            age_days = _age_days_from_seconds(_age_seconds(c.updated_at))
+            age = _age_str(_age_seconds(c.updated_at))
+            age_color = RED if age_days > 14 else (AMBER if age_days > stale_threshold else MUTED)
+            dep_str = f" [{GRAY}]deprecated[/{GRAY}]" if c.status == "deprecated" else ""
+            title_color = GRAY if c.status == "deprecated" else BODY
+            console.print(
+                f"    [{MUTED}]{c.id[:8]}[/{MUTED}] [{title_color}]{c.title[:52]}[/{title_color}]"
+                f"  [{MUTED}]imp {c.importance}[/{MUTED}]  [{age_color}]{age}[/{age_color}]{dep_str}"
+            )
+        console.print()
 
     if spec_chunks:
-        spec_table = _make_chunk_table()
-        for chunk in spec_chunks:
-            _add_chunk_row(spec_table, chunk, stale_threshold)
-        console.print(_table_panel(spec_table, f"specs  {len(spec_chunks)}"))
+        sc = TYPE_COLORS["spec"]
+        console.print(f"  [{sc}]◇ spec[/{sc}]  [{MUTED}]({len(spec_chunks)})[/{MUTED}]")
+        for c in spec_chunks:
+            console.print(f"    [{MUTED}]{c.id[:8]}[/{MUTED}] [{GRAY}]{c.title[:52]}[/{GRAY}]  [{MUTED}]re-indexed[/{MUTED}]")
+        console.print()
 
 
 @app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
@@ -511,20 +541,27 @@ def recent(
         console.print(f"[{MUTED}]· No chunks found[/{MUTED}]")
         return
 
-    RECENT_COLS = ["id", "type", "title", "age"]
     stale_threshold = config.get("stale_threshold_days", 7)
-    table = _make_chunk_table(RECENT_COLS)
-    for chunk in chunks:
-        _add_chunk_row(table, chunk, stale_threshold, RECENT_COLS)
-    for chunk in spec_chunks:
-        tc = TYPE_COLORS["spec"]
-        table.add_row(
-            f"[{MUTED}]{chunk.id[:8]}[/{MUTED}]",
-            f"[{tc}]◇ spec[/{tc}]",
-            f"[{BODY}]{chunk.title}[/{BODY}]",
-            f"[dim {MUTED}]re-indexed[/dim {MUTED}]",
+    total = len(chunks) + len(spec_chunks)
+    _hdr(f"{total} recent")
+
+    for c in chunks:
+        icon = TYPE_ICONS.get(c.type, "·")
+        color = TYPE_COLORS.get(c.type, ORANGE)
+        age_days = _age_days_from_seconds(_age_seconds(c.updated_at))
+        age = _age_str(_age_seconds(c.updated_at))
+        age_color = RED if age_days > 14 else (AMBER if age_days > stale_threshold else MUTED)
+        console.print(
+            f"  [{MUTED}]{c.id[:8]}[/{MUTED}] [{color}]{icon} {c.type:<11}[/{color}]"
+            f" [{BODY}]{c.title[:50]}[/{BODY}]  [{age_color}]{age}[/{age_color}]"
         )
-    console.print(_table_panel(table, f"recent  {len(chunks)} chunk(s)  ·  {len(spec_chunks)} spec(s)"))
+    for c in spec_chunks:
+        sc = TYPE_COLORS["spec"]
+        console.print(
+            f"  [{MUTED}]{c.id[:8]}[/{MUTED}] [{sc}]◇ spec      [/{sc}]"
+            f" [{GRAY}]{c.title[:50]}[/{GRAY}]  [{MUTED}]re-indexed[/{MUTED}]"
+        )
+    console.print()
 
 
 @app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
@@ -543,14 +580,22 @@ def stale(project: Optional[str] = typer.Option(None, "--project")):
     stale_chunks.sort(key=lambda c: c.updated_at)
 
     if not stale_chunks:
-        console.print(f"[{GREEN}]✓ No stale chunks[/{GREEN}]")
+        _hdr("all fresh")
+        console.print(f"  [{GREEN}]✓ no stale chunks[/{GREEN}]\n")
         return
 
-    STALE_COLS = ["id", "type", "title", "age", "imp"]
-    table = _make_chunk_table(STALE_COLS)
-    for chunk in stale_chunks:
-        _add_chunk_row(table, chunk, threshold, STALE_COLS)
-    console.print(_table_panel(table, f"stale  {len(stale_chunks)}  >{threshold}d"))
+    _hdr(f"{len(stale_chunks)} stale  >{threshold}d")
+    for c in stale_chunks:
+        icon = TYPE_ICONS.get(c.type, "·")
+        color = TYPE_COLORS.get(c.type, ORANGE)
+        age_days = _age_days_from_seconds(_age_seconds(c.updated_at))
+        age = _age_str(_age_seconds(c.updated_at))
+        age_color = RED if age_days > 14 else AMBER
+        console.print(
+            f"  [{MUTED}]{c.id[:8]}[/{MUTED}] [{color}]{icon} {c.type:<11}[/{color}]"
+            f" [{BODY}]{c.title[:50]}[/{BODY}]  [{age_color}]{age}[/{age_color}]  [{MUTED}]imp {c.importance}[/{MUTED}]"
+        )
+    console.print()
 
 
 @app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
@@ -578,22 +623,24 @@ def search(
             results = raw.get("chunks", []) if isinstance(raw, dict) else raw
 
     if not results:
-        console.print(f"[{MUTED}]· No results[/{MUTED}]")
+        _hdr(f'"{query}"')
+        console.print(f"  [{MUTED}]· no results[/{MUTED}]\n")
         return
 
-    table = _make_chunk_table(["type", "title", "score", "sim", "age"])
+    _hdr(f"{len(results)} result{'s' if len(results) != 1 else ''}  ·  \"{query}\"")
     for r in results:
         icon = TYPE_ICONS.get(r["type"], "·")
-        tc = TYPE_COLORS.get(r["type"], MUTED)
-        stale_badge = f" [{AMBER}]⚠[/{AMBER}]" if r.get("stale_warning") else ""
-        table.add_row(
-            f"[{tc}]{icon} {r['type']}[/{tc}]",
-            f"[{BODY}]{r['title']}[/{BODY}]{stale_badge}",
-            f"[{ORANGE}]{r['final_score']:.2f}[/{ORANGE}]",
-            f"[{MUTED}]{r['similarity']:.2f}[/{MUTED}]",
-            f"[dim {MUTED}]{r['age']}[/dim {MUTED}]",
+        color = TYPE_COLORS.get(r["type"], MUTED)
+        stale_str = f"  [{AMBER}]⚠[/{AMBER}]" if r.get("stale_warning") else ""
+        via = r.get("retrieved_via", "")
+        via_str = f"  [{MUTED}]via graph[/{MUTED}]" if via and via != "similarity" else ""
+        console.print(
+            f"  [{MUTED}]{r.get('id', '')[:8]}[/{MUTED}] [{color}]{icon} {r['type']:<11}[/{color}]"
+            f" [{BODY}]{r['title'][:50]}[/{BODY}]{stale_str}"
+            f"  [{ORANGE}]{r['final_score']:.2f}[/{ORANGE}]"
+            f"  [{MUTED}]sim {r['similarity']:.2f}  {r['age']}[/{MUTED}]{via_str}"
         )
-    console.print(_table_panel(table, f"results  {len(results)}"))
+    console.print()
 
 
 @app.command(rich_help_panel="[bold #4ade80]Memory[/bold #4ade80]")
@@ -658,23 +705,29 @@ def stats(project: Optional[str] = typer.Option(None, "--project")):
     top_retrieved = sorted(active, key=lambda c: getattr(c, "retrieval_count", 0), reverse=True)[:3]
 
     db_size = _dir_size(granum_dir / "kuzu.db")
-    proj = Path(_git_root() or ".").name
-    branch = _git_branch()
-    t = _kv_table()
-    t.add_row("project",    f"[{BODY}]{proj}[/{BODY}] [dim {MUTED}]{branch}[/dim {MUTED}]")
-    t.add_row("spec paths", f"[{BODY}]{', '.join(config.get('spec_paths', [])) or 'none'}[/{BODY}]")
-    t.add_row("memory",     f"[{GREEN}]{len(active)} active[/{GREEN}]  [dim {GRAY}]{len(deprecated)} deprecated[/dim {GRAY}]")
-    t.add_row("specs",      f"[{BODY}]{len(spec_chunks)} indexed[/{BODY}]")
-    t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("db size",    f"[{BODY}]{db_size}[/{BODY}]")
-    t.add_row("embedding",  f"[dim {MUTED}]{config.get('embedding_model', 'all-MiniLM-L6-v2')}[/dim {MUTED}]")
+    _hdr(f"{len(active)} active  ·  {len(spec_chunks)} specs")
+
+    def _kv(key: str, val: str) -> None:
+        console.print(f"  [{MUTED}]{key:<14}[/{MUTED}] {val}")
+
+    spec_paths_str = ", ".join(config.get("spec_paths", [])) or "none"
+    _kv("spec paths",  f"[{BODY}]{spec_paths_str}[/{BODY}]")
+    _kv("memory",      f"[{GREEN}]{len(active)} active[/{GREEN}]  [{GRAY}]{len(deprecated)} deprecated[/{GRAY}]")
+    _kv("specs",       f"[{BODY}]{len(spec_chunks)} indexed[/{BODY}]")
+    _kv("stale",       f"[{AMBER}]{len(stale)}[/{AMBER}]" if stale else f"[{MUTED}]0[/{MUTED}]")
+    _kv("db size",     f"[{BODY}]{db_size}[/{BODY}]")
+    _kv("embedding",   f"[{MUTED}]{config.get('embedding_model', 'all-MiniLM-L6-v2')}[/{MUTED}]")
     if top_retrieved and getattr(top_retrieved[0], "retrieval_count", 0) > 0:
-        top_str = "  ".join(
-            f"[{BODY}]{c.title[:24]}[/{BODY}] [{ORANGE}]×{getattr(c, 'retrieval_count', 0)}[/{ORANGE}]"
-            for c in top_retrieved
-        )
-        t.add_row("top retrieved", top_str)
-    console.print(Panel(t, title=f"[bold {ORANGE}]stats[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
+        console.print()
+        console.print(f"  [{MUTED}]top retrieved[/{MUTED}]")
+        for c in top_retrieved:
+            icon = TYPE_ICONS.get(c.type, "·")
+            color = TYPE_COLORS.get(c.type, ORANGE)
+            console.print(
+                f"    [{color}]{icon}[/{color}] [{BODY}]{c.title[:50]}[/{BODY}]"
+                f"  [{ORANGE}]×{getattr(c, 'retrieval_count', 0)}[/{ORANGE}]"
+            )
+    console.print()
 
 
 @app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
@@ -717,36 +770,39 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
 
     orphans = _find_orphans(active, all_edges or [])
 
-    proj = Path(_git_root() or ".").name
-    branch = _git_branch()
-    t = _kv_table()
-    t.add_row("project",    f"[{BODY}]{proj}[/{BODY}] [dim {MUTED}]{branch}[/dim {MUTED}]")
-    t.add_row("active",     f"[{GREEN}]{len(active)}[/{GREEN}]")
-    t.add_row("specs",      f"[{BODY}]{len(spec_chunks)}[/{BODY}]")
-    t.add_row("edges",      f"[{BODY}]{len(all_edges or [])}[/{BODY}]")
-    t.add_row("deprecated", f"[dim {GRAY}]{len(deprecated)}[/dim {GRAY}]")
-    t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}] [dim {MUTED}](>{threshold}d)[/dim {MUTED}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("very stale", f"[{RED}]{len(very_stale)}[/{RED}] [dim {MUTED}](>30d)[/dim {MUTED}]" if very_stale else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("conflicts",  f"[{RED}]{len(unique_conflicts)} pair(s)[/{RED}]" if unique_conflicts else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("low value",   f"[{AMBER}]{len(low_value)}[/{AMBER}] [dim {MUTED}](imp ≤2, stale)[/dim {MUTED}]" if low_value else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("orphans",     f"[{MUTED}]{len(orphans)}[/{MUTED}] [dim {MUTED}](no edges)[/dim {MUTED}]" if orphans else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("undervalued", f"[{AMBER}]{len(undervalued)}[/{AMBER}] [dim {MUTED}](retrieved ≥5×, imp ≤2)[/dim {MUTED}]" if undervalued else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("never used",  f"[{MUTED}]{len(never_used)}[/{MUTED}] [dim {MUTED}](imp ≥4, 0 retrievals)[/dim {MUTED}]" if never_used else f"[dim {MUTED}]0[/dim {MUTED}]")
-    console.print(Panel(t, title=f"[bold {ORANGE}]audit[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
+    _hdr(f"{len(active)} active  ·  {len(spec_chunks)} specs  ·  {len(all_edges or [])} edges")
+
+    def _kv(key: str, val: str) -> None:
+        console.print(f"  [{MUTED}]{key:<14}[/{MUTED}] {val}")
+
+    _kv("active",      f"[{GREEN}]{len(active)}[/{GREEN}]")
+    _kv("specs",       f"[{BODY}]{len(spec_chunks)}[/{BODY}]")
+    _kv("edges",       f"[{BODY}]{len(all_edges or [])}[/{BODY}]")
+    _kv("deprecated",  f"[{GRAY}]{len(deprecated)}[/{GRAY}]")
+    _kv("stale",       f"[{AMBER}]{len(stale)}[/{AMBER}]  [{MUTED}](>{threshold}d)[/{MUTED}]" if stale else f"[{MUTED}]0[/{MUTED}]")
+    _kv("very stale",  f"[{RED}]{len(very_stale)}[/{RED}]  [{MUTED}](>30d)[/{MUTED}]" if very_stale else f"[{MUTED}]0[/{MUTED}]")
+    _kv("conflicts",   f"[{RED}]{len(unique_conflicts)} pair(s)[/{RED}]" if unique_conflicts else f"[{MUTED}]0[/{MUTED}]")
+    _kv("low value",   f"[{AMBER}]{len(low_value)}[/{AMBER}]  [{MUTED}](imp ≤2, stale)[/{MUTED}]" if low_value else f"[{MUTED}]0[/{MUTED}]")
+    _kv("orphans",     f"[{MUTED}]{len(orphans)}[/{MUTED}]  [{MUTED}](no edges)[/{MUTED}]" if orphans else f"[{MUTED}]0[/{MUTED}]")
+    _kv("undervalued", f"[{AMBER}]{len(undervalued)}[/{AMBER}]  [{MUTED}](retrieved ≥5×, imp ≤2)[/{MUTED}]" if undervalued else f"[{MUTED}]0[/{MUTED}]")
+    _kv("never used",  f"[{MUTED}]{len(never_used)}[/{MUTED}]  [{MUTED}](imp ≥4, 0 retrievals)[/{MUTED}]" if never_used else f"[{MUTED}]0[/{MUTED}]")
 
     if unique_conflicts:
-        console.print(f"  [{RED}]CONTRADICTING pairs — resolve with cleanup_context merge or deprecate:[/{RED}]")
+        console.print()
+        console.print(f"  [{RED}]⟷ conflicts[/{RED}]  [{MUTED}]({len(unique_conflicts)})[/{MUTED}]")
         for from_id, from_title, to_id, to_title, conf in unique_conflicts:
             console.print(
-                f"    [{MUTED}]{from_id[:8]}[/{MUTED}] [{ORANGE}]{from_title[:40]}[/{ORANGE}]"
+                f"    [{MUTED}]{from_id[:8]}[/{MUTED}] [{ORANGE}]{from_title[:36]}[/{ORANGE}]"
                 f"  [{RED}]⟷[/{RED}]  "
-                f"[{MUTED}]{to_id[:8]}[/{MUTED}] [{ORANGE}]{to_title[:40]}[/{ORANGE}]"
+                f"[{MUTED}]{to_id[:8]}[/{MUTED}] [{ORANGE}]{to_title[:36]}[/{ORANGE}]"
                 f"  [{MUTED}]sim {conf:.2f}[/{MUTED}]"
             )
-        console.print()
 
     if low_value:
-        console.print(f"[{MUTED}]→ run cleanup_context on {len(low_value)} low-value chunk(s)[/{MUTED}]")
+        console.print()
+        console.print(f"  [{MUTED}]→ {len(low_value)} low-value chunk(s) — call cleanup_context to deprecate[/{MUTED}]")
+
+    console.print()
 
 
 @app.command(rich_help_panel="[bold #4ade80]Analysis[/bold #4ade80]")
@@ -793,7 +849,8 @@ def timeline(
         else:
             return f"[bold {ORANGE}]▪[/bold {ORANGE}]  "
 
-    console.print(_context_panel(len(all_chunks), len(spec_chunks)))
+    total = len(all_chunks) + len(spec_chunks)
+    _hdr(f"{total} chunk{'s' if total != 1 else ''}  ·  {months} month{'s' if months != 1 else ''}")
 
     for m_offset in range(months - 1, -1, -1):
         year = today.year
@@ -1450,15 +1507,13 @@ def history(
 
     icon = TYPE_ICONS.get(current.type, "◆")
     color = TYPE_COLORS.get(current.type, ORANGE)
-
-    console.print()
-    console.print(f"[{ORANGE}]◆ Version history —[/{ORANGE}] [{color}]{icon} {current.title}[/{color}]")
-    console.print(f"  [{MUTED}]{full_id[:12]}[/{MUTED}]")
-    console.print()
-
     age = _age_str(_age_seconds(current.updated_at or ""))
+    v_count = len(versions) if versions else 0
+
+    _hdr(f"{icon} {current.title[:48]}  ·  {v_count} version{'s' if v_count != 1 else ''}")
+    console.print(f"  [{MUTED}]{full_id[:12]}[/{MUTED}]\n")
     console.print(f"  [{GREEN}]✓ current[/{GREEN}]  [{BODY}]{current.content[:120]}[/{BODY}]")
-    console.print(f"  [{MUTED}]  updated {age} · importance {current.importance}[/{MUTED}]")
+    console.print(f"  [{MUTED}]  updated {age}  ·  imp {current.importance}[/{MUTED}]")
 
     if not versions:
         console.print()
@@ -1528,8 +1583,7 @@ def drift(
     flagged = [r for r in results if r["verdict"] in ("drifted", "stale")]
     clean   = [r for r in results if r["verdict"] == "ok"]
 
-    proj = Path(git_root).name
-    console.print(f"\n  [{ORANGE}]{proj}[/{ORANGE}]  [{MUTED}]·  {len(results)} chunk(s) checked[/{MUTED}]\n")
+    _hdr(f"{len(results)} chunk{'s' if len(results) != 1 else ''} checked")
 
     if flagged:
         console.print(f"  [{RED}]⚠ potentially drifted ({len(flagged)})[/{RED}]\n")
@@ -1584,8 +1638,7 @@ def summarize(
     for c in chunks:
         by_type.setdefault(c.type, []).append(c)
 
-    proj = Path(_git_root() or ".").name
-    console.print(f"\n  [{ORANGE}]{proj}[/{ORANGE}]  [{MUTED}]·  last {hours}h  ·  {len(chunks)} change(s)[/{MUTED}]\n")
+    _hdr(f"last {hours}h  ·  {len(chunks)} change{'s' if len(chunks) != 1 else ''}")
 
     type_order = ["decision", "constraint", "file_state", "preference"]
     for t in type_order:
