@@ -96,8 +96,11 @@ _SERVER_INSTRUCTIONS = (
 
     "BEFORE any other action each turn:\n"
     "  Call query_context with the user's message to retrieve relevant memory.\n"
-    "  Before acting on any retrieved chunk that names a specific file, function, flag, or config key —\n"
-    "  verify it still exists in the codebase first. If it does not, update or deprecate the chunk before proceeding.\n\n"
+    "  query_context returns {\"chunks\": [...], \"unresolved_conflicts\": [...]}.\n"
+    "  If unresolved_conflicts is non-empty: resolve them FIRST before answering — call add_edge(CONTRADICTS)\n"
+    "  to confirm, or cleanup_context(deprecate/merge) to resolve. Do not ignore conflicts.\n"
+    "  Before acting on any retrieved chunk naming a specific file/function/flag —\n"
+    "  verify it still exists in the codebase first. If not, update or deprecate before proceeding.\n\n"
     "ANYTIME mid-turn you are about to make an assumption about the project — check first:\n"
     "  If you are unsure about a past decision, a file's current state, a user preference, or a constraint,\n"
     "  call query_context with a focused query before guessing. You may have already saved the answer.\n\n"
@@ -148,8 +151,13 @@ _SERVER_INSTRUCTIONS = (
     "  Phase 1: similarity seeds all chunks above 0.3 threshold.\n"
     "  Phase 2: BFS from top-5 memory seeds over DEPENDS_ON, RELATES_TO, DERIVED_FROM, SUPERSEDES (depth ≤ 2).\n"
     "  Phase 3: direct similarity hits override graph hits; type quotas applied; top results returned.\n"
-    "  Each result has 'retrieved_via': 'similarity' for direct hits, or a traversal path string for graph hits.\n"
-    "  Graph hits surface related chunks even when their query similarity is low — trust them."
+    "  Each chunk has 'retrieved_via': 'similarity' for direct hits, or a traversal path string for graph hits.\n"
+    "  Graph hits surface related chunks even when their query similarity is low — trust them.\n\n"
+    "AFTER save_context: check the response for 'merge_candidates'.\n"
+    "  If present, these are active chunks with cosine similarity ≥ 0.85 to the one you just saved.\n"
+    "  Strong signal they cover the same topic. Consider calling cleanup_context(merge) to consolidate.\n"
+    "  Each chunk also has 'retrieval_count' — how many times it has been retrieved. High count + low\n"
+    "  importance = consider bumping importance. Zero count after many sessions = candidate for cleanup."
 )
 
 app = Server("granum", instructions=_SERVER_INSTRUCTIONS)
@@ -319,7 +327,7 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         if name == "query_context":
-            results = db.query_context(
+            result = db.query_context(
                 project_id=project_id,
                 query=arguments["query"],
                 type_filter=arguments.get("type_filter"),
@@ -327,7 +335,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 spec_limit=arguments.get("spec_limit", spec_retrieval_limit),
                 freshness_decay_days=freshness_decay_days,
             )
-            return [TextContent(type="text", text=json.dumps(results, indent=2))]
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         elif name == "save_context":
             result = db.save_context(

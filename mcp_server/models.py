@@ -46,6 +46,7 @@ class Chunk:
     created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
     deleted_at: Optional[str] = None
+    retrieval_count: int = 0
 
     @classmethod
     def create(
@@ -81,6 +82,7 @@ class Chunk:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "deleted_at": self.deleted_at,
+            "retrieval_count": self.retrieval_count,
         }
 
     @classmethod
@@ -97,6 +99,7 @@ class Chunk:
             created_at=d.get("created_at", _now()),
             updated_at=d.get("updated_at", _now()),
             deleted_at=d.get("deleted_at"),
+            retrieval_count=int(d.get("retrieval_count") or 0),
         )
 
 

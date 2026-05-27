@@ -135,11 +135,17 @@ def _ipc_call(granum_dir: Path, method: str, params: dict) -> Optional[any]:
 
 
 def _ipc_query(granum_dir: Path, query: str, config: dict) -> Optional[list]:
-    return _ipc_call(granum_dir, "query_context", {
+    raw = _ipc_call(granum_dir, "query_context", {
         "query": query,
         "memory_limit": config.get("memory_retrieval_limit", 7),
         "spec_limit": config.get("spec_retrieval_limit", 3),
     })
+    if raw is None:
+        return None
+    # query_context now returns {chunks, unresolved_conflicts}
+    if isinstance(raw, dict):
+        return raw.get("chunks", [])
+    return raw  # fallback: old list format
 
 
 def _ipc_chunks(granum_dir: Path, project_id: str, include_deprecated: bool = False) -> Optional[list]:
@@ -569,13 +575,14 @@ def search(
             db = _get_db(config, granum_dir)
             db.import_ndjson()
             status.update("Running similarity search")
-            results = db.query_context(
+            raw = db.query_context(
                 project_id=project_id,
                 query=query,
                 memory_limit=config.get("memory_retrieval_limit", 7),
                 spec_limit=config.get("spec_retrieval_limit", 3),
                 freshness_decay_days=config.get("freshness_decay_days", 90),
             )
+            results = raw.get("chunks", []) if isinstance(raw, dict) else raw
 
     if not results:
         console.print(f"[{MUTED}]· No results[/{MUTED}]")
@@ -657,6 +664,7 @@ def stats(project: Optional[str] = typer.Option(None, "--project")):
 
     deprecated = [c for c in all_chunks if c.status == "deprecated"]
     stale = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
+    top_retrieved = sorted(active, key=lambda c: getattr(c, "retrieval_count", 0), reverse=True)[:3]
 
     db_size = _dir_size(granum_dir / "kuzu.db")
     proj = Path(_git_root() or ".").name
@@ -669,6 +677,12 @@ def stats(project: Optional[str] = typer.Option(None, "--project")):
     t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
     t.add_row("db size",    f"[{BODY}]{db_size}[/{BODY}]")
     t.add_row("embedding",  f"[dim {MUTED}]{config.get('embedding_model', 'all-MiniLM-L6-v2')}[/dim {MUTED}]")
+    if top_retrieved and getattr(top_retrieved[0], "retrieval_count", 0) > 0:
+        top_str = "  ".join(
+            f"[{BODY}]{c.title[:24]}[/{BODY}] [{ORANGE}]×{getattr(c, 'retrieval_count', 0)}[/{ORANGE}]"
+            for c in top_retrieved
+        )
+        t.add_row("top retrieved", top_str)
     console.print(Panel(t, title=f"[bold {ORANGE}]stats[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
 
 
@@ -693,12 +707,15 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
         status.update("Analysing")
         active = [c for c in all_chunks if c.status == "active"]
 
-    deprecated  = [c for c in all_chunks if c.status == "deprecated"]
-    stale       = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
-    very_stale  = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > 30]
-    low_value   = [c for c in active if c.importance <= 2 and _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
-    conflicts   = [(e["from_id"], e["from_title"], e["to_id"], e["to_title"], e.get("confidence", 1.0))
-                   for e in (all_edges or []) if e["edge_type"] == "CONTRADICTS"]
+    deprecated     = [c for c in all_chunks if c.status == "deprecated"]
+    stale          = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
+    very_stale     = [c for c in active if _age_days_from_seconds(_age_seconds(c.updated_at)) > 30]
+    low_value      = [c for c in active if c.importance <= 2 and _age_days_from_seconds(_age_seconds(c.updated_at)) > threshold]
+    # Retrieval anomalies
+    undervalued    = [c for c in active if getattr(c, "retrieval_count", 0) >= 5 and c.importance <= 2]
+    never_used     = [c for c in active if getattr(c, "retrieval_count", 0) == 0 and c.importance >= 4]
+    conflicts      = [(e["from_id"], e["from_title"], e["to_id"], e["to_title"], e.get("confidence", 1.0))
+                     for e in (all_edges or []) if e["edge_type"] == "CONTRADICTS"]
     # Deduplicate bidirectional pairs
     seen_pairs: set[frozenset] = set()
     unique_conflicts = []
@@ -721,8 +738,10 @@ def audit(project: Optional[str] = typer.Option(None, "--project")):
     t.add_row("stale",      f"[{AMBER}]{len(stale)}[/{AMBER}] [dim {MUTED}](>{threshold}d)[/dim {MUTED}]" if stale else f"[dim {MUTED}]0[/dim {MUTED}]")
     t.add_row("very stale", f"[{RED}]{len(very_stale)}[/{RED}] [dim {MUTED}](>30d)[/dim {MUTED}]" if very_stale else f"[dim {MUTED}]0[/dim {MUTED}]")
     t.add_row("conflicts",  f"[{RED}]{len(unique_conflicts)} pair(s)[/{RED}]" if unique_conflicts else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("low value",  f"[{AMBER}]{len(low_value)}[/{AMBER}] [dim {MUTED}](imp ≤2, stale)[/dim {MUTED}]" if low_value else f"[dim {MUTED}]0[/dim {MUTED}]")
-    t.add_row("orphans",    f"[{MUTED}]{len(orphans)}[/{MUTED}] [dim {MUTED}](no edges)[/dim {MUTED}]" if orphans else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("low value",   f"[{AMBER}]{len(low_value)}[/{AMBER}] [dim {MUTED}](imp ≤2, stale)[/dim {MUTED}]" if low_value else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("orphans",     f"[{MUTED}]{len(orphans)}[/{MUTED}] [dim {MUTED}](no edges)[/dim {MUTED}]" if orphans else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("undervalued", f"[{AMBER}]{len(undervalued)}[/{AMBER}] [dim {MUTED}](retrieved ≥5×, imp ≤2)[/dim {MUTED}]" if undervalued else f"[dim {MUTED}]0[/dim {MUTED}]")
+    t.add_row("never used",  f"[{MUTED}]{len(never_used)}[/{MUTED}] [dim {MUTED}](imp ≥4, 0 retrievals)[/dim {MUTED}]" if never_used else f"[dim {MUTED}]0[/dim {MUTED}]")
     console.print(Panel(t, title=f"[bold {ORANGE}]audit[/bold {ORANGE}]", border_style=GRAY, padding=(0, 1)))
 
     if unique_conflicts:
@@ -1086,11 +1105,12 @@ def graph(
                 db = _get_db(config, granum_dir)
                 db.import_ndjson()
                 status.update("Searching")
-                results = db.query_context(
+                raw = db.query_context(
                     project_id=project_id, query=query,
                     memory_limit=1, spec_limit=0,
                     freshness_decay_days=config.get("freshness_decay_days", 90),
                 )
+                results = raw.get("chunks", []) if isinstance(raw, dict) else raw
 
         memory_only = [r for r in (results or []) if r.get("type") != "spec"]
         if not memory_only:

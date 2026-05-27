@@ -144,6 +144,12 @@ class GranumDB:
                 PRIMARY KEY(id)
             )
         """)
+        # Migration: add retrieval_count if not present (existing DBs)
+        try:
+            self._conn.execute("ALTER TABLE Chunk ADD retrieval_count INT64 DEFAULT 0")
+        except Exception:
+            pass
+
         for et in EDGE_TYPES:
             self._conn.execute(f"""
                 CREATE REL TABLE IF NOT EXISTS {et}(
@@ -161,7 +167,7 @@ class GranumDB:
     _CHUNK_COLS = [
         "id", "project_id", "title", "content", "type",
         "importance", "status", "source", "embedding",
-        "created_at", "updated_at", "deleted_at",
+        "created_at", "updated_at", "deleted_at", "retrieval_count",
     ]
 
     _CHUNK_RETURN = ", ".join(f"c.{col}" for col in _CHUNK_COLS)
@@ -180,6 +186,7 @@ class GranumDB:
             created_at=d.get("created_at") or "",
             updated_at=d.get("updated_at") or "",
             deleted_at=d.get("deleted_at") or None,
+            retrieval_count=int(d.get("retrieval_count") or 0),
         )
 
     def _get_by_id(self, chunk_id: str) -> Optional[Chunk]:
@@ -205,39 +212,42 @@ class GranumDB:
         if embedding is None:
             embedding = _embed(make_embedding_target(chunk.type, chunk.title, chunk.content))
         p = {
-            "id":         chunk.id,
-            "project_id": chunk.project_id,
-            "title":      chunk.title,
-            "content":    chunk.content,
-            "type":       chunk.type,
-            "importance": int(chunk.importance),
-            "status":     chunk.status,
-            "source":     chunk.source or "",
-            "embedding":  embedding,
-            "created_at": chunk.created_at,
-            "updated_at": chunk.updated_at,
-            "deleted_at": chunk.deleted_at or "",
+            "id":              chunk.id,
+            "project_id":      chunk.project_id,
+            "title":           chunk.title,
+            "content":         chunk.content,
+            "type":            chunk.type,
+            "importance":      int(chunk.importance),
+            "status":          chunk.status,
+            "source":          chunk.source or "",
+            "embedding":       embedding,
+            "created_at":      chunk.created_at,
+            "updated_at":      chunk.updated_at,
+            "deleted_at":      chunk.deleted_at or "",
+            "retrieval_count": int(chunk.retrieval_count),
         }
         if self._exists(chunk.id):
             self._conn.execute("""
                 MATCH (c:Chunk {id: $id})
-                SET c.title      = $title,
-                    c.content    = $content,
-                    c.type       = $type,
-                    c.importance = $importance,
-                    c.status     = $status,
-                    c.source     = $source,
-                    c.embedding  = $embedding,
-                    c.updated_at = $updated_at,
-                    c.deleted_at = $deleted_at
-            """, {k: v for k, v in p.items() if k != "project_id" and k != "created_at"})
+                SET c.title           = $title,
+                    c.content         = $content,
+                    c.type            = $type,
+                    c.importance      = $importance,
+                    c.status          = $status,
+                    c.source          = $source,
+                    c.embedding       = $embedding,
+                    c.updated_at      = $updated_at,
+                    c.deleted_at      = $deleted_at,
+                    c.retrieval_count = $retrieval_count
+            """, {k: v for k, v in p.items() if k not in ("project_id", "created_at")})
         else:
             self._conn.execute("""
                 CREATE (:Chunk {
                     id: $id, project_id: $project_id, title: $title,
                     content: $content, type: $type, importance: $importance,
                     status: $status, source: $source, embedding: $embedding,
-                    created_at: $created_at, updated_at: $updated_at, deleted_at: $deleted_at
+                    created_at: $created_at, updated_at: $updated_at, deleted_at: $deleted_at,
+                    retrieval_count: $retrieval_count
                 })
             """, p)
 
@@ -438,12 +448,13 @@ class GranumDB:
             MATCH (c:Chunk)
             WHERE c.project_id = $pid AND c.type IN ['{type_list}']
             RETURN c.id, c.project_id, c.title, c.content, c.type,
-                   c.importance, c.status, c.source, c.created_at, c.updated_at, c.deleted_at
+                   c.importance, c.status, c.source, c.created_at, c.updated_at, c.deleted_at,
+                   c.retrieval_count
             """,
             {"pid": project_id},
         )
         cols = ["id", "project_id", "title", "content", "type", "importance",
-                "status", "source", "created_at", "updated_at", "deleted_at"]
+                "status", "source", "created_at", "updated_at", "deleted_at", "retrieval_count"]
         output: dict[str, dict] = {}
         live_ids: set[str] = set()
 
@@ -576,7 +587,29 @@ class GranumDB:
             ),
             embedding,
         )
-        return {"action": action, "id": chunk_id}
+
+        # Feature 5: flag high-sim RELATES_TO neighbors as merge candidates
+        merge_candidates = []
+        try:
+            res = self._conn.execute(
+                """
+                MATCH (a:Chunk {id: $id})-[r:RELATES_TO]-(b:Chunk)
+                WHERE b.status = 'active' AND b.deleted_at = '' AND b.type = $type
+                  AND r.confidence >= 0.85
+                RETURN b.id, b.title, r.confidence
+                """,
+                {"id": chunk_id, "type": chunk_type},
+            )
+            while res.has_next():
+                row = res.get_next()
+                merge_candidates.append({"id": row[0], "title": row[1], "similarity": round(row[2], 4)})
+        except Exception:
+            pass
+
+        result = {"action": action, "id": chunk_id}
+        if merge_candidates:
+            result["merge_candidates"] = merge_candidates
+        return result
 
     # ------------------------------------------------------------------
     # cleanup_context
@@ -874,7 +907,47 @@ class GranumDB:
 
         results = memory_results + spec_results
         results.sort(key=lambda x: -x["final_score"])
-        return results
+
+        # Increment retrieval_count for every returned chunk
+        for r in results:
+            try:
+                self._conn.execute(
+                    "MATCH (c:Chunk {id: $id}) SET c.retrieval_count = c.retrieval_count + 1",
+                    {"id": r["id"]},
+                )
+            except Exception:
+                pass
+
+        return {
+            "chunks": results,
+            "unresolved_conflicts": self._get_project_conflicts(project_id),
+        }
+
+    def _get_project_conflicts(self, project_id: str) -> list[dict]:
+        try:
+            res = self._conn.execute(
+                """
+                MATCH (a:Chunk)-[r:CONTRADICTS]->(b:Chunk)
+                WHERE a.project_id = $pid AND a.status = 'active' AND b.status = 'active'
+                RETURN a.id, a.title, b.id, b.title, r.confidence
+                """,
+                {"pid": project_id},
+            )
+            seen: set[frozenset] = set()
+            out = []
+            while res.has_next():
+                row = res.get_next()
+                key = frozenset([row[0], row[2]])
+                if key not in seen:
+                    seen.add(key)
+                    out.append({
+                        "chunk_a": {"id": row[0], "title": row[1]},
+                        "chunk_b": {"id": row[2], "title": row[3]},
+                        "confidence": round(row[4], 4),
+                    })
+            return out
+        except Exception:
+            return []
 
     def _get_conflicts(self, chunk_id: str) -> list[dict]:
         try:
