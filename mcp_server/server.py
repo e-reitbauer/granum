@@ -509,25 +509,36 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 _MAX_CHUNK_CHARS = 1800  # split sections larger than this by paragraph
 
 
-def _split_by_paragraph(title: str, content: str, source: str) -> list[dict]:
-    """Split a large section into paragraph-sized chunks."""
+def _split_by_paragraph(title: str, content: str, source: str, parent_titles: list[str]) -> list[dict]:
+    """Split a large section into paragraph-sized chunks.
+
+    Continuation parts chain back to the previous part so the split section stays
+    connected: part 1 hangs off the section's parent, part N off part N-1.
+    """
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
     if not paragraphs:
         return []
     chunks = []
     current = ""
     part = 1
+    prev_title = None  # title of the previously emitted part
+
+    def _emit(label: str, body: str) -> None:
+        nonlocal prev_title
+        parents = [prev_title] + parent_titles if prev_title else list(parent_titles)
+        chunks.append({"title": label, "content": body, "source": source, "parent_titles": parents})
+        prev_title = label
+
     for para in paragraphs:
         candidate = (current + "\n\n" + para).strip() if current else para
         if len(candidate) > _MAX_CHUNK_CHARS and current:
-            chunks.append({"title": f"{title} ({part})", "content": current, "source": source})
+            _emit(f"{title} ({part})", current)
             current = para
             part += 1
         else:
             current = candidate
     if current:
-        label = f"{title} ({part})" if part > 1 else title
-        chunks.append({"title": label, "content": current, "source": source})
+        _emit(f"{title} ({part})" if part > 1 else title, current)
     return chunks
 
 
@@ -537,16 +548,16 @@ def _chunk_by_section(text: str, source_file: str) -> list[dict]:
     file_stem = _Path(source_file).stem
 
     # Parse heading hierarchy and accumulate body lines
-    sections: list[tuple[str, list[str]]] = []  # (heading_path, lines)
+    sections: list[tuple[str, list[str], list[str]]] = []  # (title, lines, parent_titles)
     heading_stack: list[tuple[int, str]] = []   # (level, text)
     current_lines: list[str] = []
 
     def _flush(stack: list[tuple[int, str]], lines: list[str]) -> None:
-        if not stack:
-            title = file_stem
-        else:
-            title = " > ".join(h for _, h in stack)
-        sections.append((title, list(lines)))
+        path = [h for _, h in stack]
+        title = " > ".join(path) if path else file_stem
+        # Ancestor joined-titles, nearest → root: ["A > B > C"] -> ["A > B", "A"]
+        parent_titles = [" > ".join(path[:i]) for i in range(len(path) - 1, 0, -1)]
+        sections.append((title, list(lines), parent_titles))
 
     for line in text.splitlines():
         if line.startswith("#"):
@@ -564,17 +575,17 @@ def _chunk_by_section(text: str, source_file: str) -> list[dict]:
 
     # Build chunks, splitting oversized sections by paragraph
     chunks: list[dict] = []
-    for title, lines in sections:
+    for title, lines, parent_titles in sections:
         content = "\n".join(lines).strip()
         if not content:
             continue
         source = f"{source_file}#{title}"
         if len(content) <= _MAX_CHUNK_CHARS:
-            chunks.append({"title": title, "content": content, "source": source})
+            chunks.append({"title": title, "content": content, "source": source, "parent_titles": parent_titles})
         else:
-            chunks.extend(_split_by_paragraph(title, content, source))
+            chunks.extend(_split_by_paragraph(title, content, source, parent_titles))
 
-    return chunks if chunks else [{"title": file_stem, "content": text[:_MAX_CHUNK_CHARS], "source": source_file}]
+    return chunks if chunks else [{"title": file_stem, "content": text[:_MAX_CHUNK_CHARS], "source": source_file, "parent_titles": []}]
 
 
 def _reindex_all_specs() -> int:

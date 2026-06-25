@@ -536,6 +536,11 @@ class GranumDB:
                 )
                 while res.has_next():
                     row = res.get_next()
+                    # Structural spec-hierarchy edges are regenerated from source
+                    # each index — don't persist them to git.
+                    if row[3] == "hierarchy":
+                        existing.pop((row[0], row[1], et), None)
+                        continue
                     key = (row[0], row[1], et)
                     existing[key] = {
                         "from_id":    row[0],
@@ -868,6 +873,40 @@ class GranumDB:
 
         return graph_hits
 
+    def _expand_spec_hierarchy(
+        self,
+        spec_seed_ids: list[str],
+        seed_scores: dict[str, float],
+        chunk_map: dict[str, dict],
+    ) -> dict[str, dict]:
+        """One hop over spec-hierarchy RELATES_TO edges (created_by='hierarchy').
+
+        Pulls a matching spec section's parent/child sections for context. Spec
+        pool only — never reaches memory chunks, so the separate-pool invariant holds.
+        """
+        hits: dict[str, dict] = {}
+        for src_id in spec_seed_ids:
+            score = seed_scores[src_id] * 0.6
+            res = self._conn.execute(
+                """
+                MATCH (a:Chunk {id: $id})-[r:RELATES_TO]-(b:Chunk)
+                WHERE r.created_by = 'hierarchy'
+                  AND b.type = 'spec' AND b.status = 'active' AND b.deleted_at = ''
+                RETURN b.id
+                """,
+                {"id": src_id},
+            )
+            while res.has_next():
+                nbr_id = res.get_next()[0]
+                nbr_row = chunk_map.get(nbr_id)
+                if not nbr_row:
+                    continue
+                scored = self._score_chunk(nbr_row, score, 90)
+                scored["retrieved_via"] = "spec hierarchy"
+                if nbr_id not in hits or hits[nbr_id]["final_score"] < scored["final_score"]:
+                    hits[nbr_id] = scored
+        return hits
+
     def query_context(
         self,
         project_id: str,
@@ -916,8 +955,15 @@ class GranumDB:
             top_seed_ids, seed_scores, chunk_map, depth=2, min_score=0.35
         )
 
+        # ── Phase 2b: spec-hierarchy hop from top spec seeds ──────────────
+        top_spec_ids = [
+            cid for cid, _ in sorted(seed_scores.items(), key=lambda x: -x[1])
+            if chunk_map[cid]["type"] == "spec"
+        ][:3]
+        spec_hier_hits = self._expand_spec_hierarchy(top_spec_ids, seed_scores, chunk_map)
+
         # ── Phase 3: merge — direct similarity wins on id conflict ─────────
-        merged: dict[str, dict] = {**graph_hits, **sim_hits}  # sim_hits overrides
+        merged: dict[str, dict] = {**graph_hits, **spec_hier_hits, **sim_hits}  # sim_hits overrides
 
         # ── Phase 4: quota + trim per pool ────────────────────────────────
         quota = max(3, memory_limit // 3)
@@ -1167,12 +1213,28 @@ class GranumDB:
     # ------------------------------------------------------------------
 
     def index_spec_file(self, project_id: str, file_path: str, chunks: list[dict]) -> int:
-        # Compute IDs for incoming chunks
-        incoming_ids: set[str] = set()
-        for c in chunks:
-            incoming_ids.add(hashlib.sha256(
-                f"{project_id}spec{file_path}{normalize_title(c['title'])}".encode()
-            ).hexdigest())
+        from pathlib import Path as _Path
+
+        def _cid(title: str) -> str:
+            return hashlib.sha256(
+                f"{project_id}spec{file_path}{normalize_title(title)}".encode()
+            ).hexdigest()
+
+        # Synthetic file-root so every section hangs from ONE tree per file.
+        # Reuse an existing chunk whose normalized id collides with the stem
+        # (e.g. a preamble chunk, or a top-level heading == filename).
+        root_title = _Path(file_path).stem
+        root_id = _cid(root_title)
+        if root_id not in {_cid(c["title"]) for c in chunks}:
+            chunks = chunks + [{
+                "title":         root_title,
+                "content":       f"Spec file: {file_path}",
+                "source":        file_path,
+                "parent_titles": [],
+            }]
+
+        # Compute IDs for incoming chunks (includes the synthetic root)
+        incoming_ids: set[str] = {_cid(c["title"]) for c in chunks}
 
         # Find existing spec chunk IDs for this file
         try:
@@ -1236,7 +1298,71 @@ class GranumDB:
                     },
                 )
             count += 1
+
+        # Second pass: wire ONE markdown tree per file. Each section links to its
+        # nearest existing ancestor; sections with no ancestor chunk hang off the
+        # file root. Reuses RELATES_TO, tagged created_by="hierarchy".
+        title_to_id = {c["title"]: _cid(c["title"]) for c in chunks}
+        for c in chunks:
+            child_id = title_to_id[c["title"]]
+            if child_id == root_id:
+                continue
+            parent_id = next(
+                (title_to_id[pt] for pt in c.get("parent_titles", []) if pt in title_to_id),
+                root_id,
+            )
+            self._add_edge(parent_id, child_id, "RELATES_TO", 0.6, "hierarchy")
+
+        # Third pass: chain the file root up through directory nodes so all spec
+        # files share one tree mirroring the folder layout.
+        self._link_spec_dir_tree(project_id, file_path, root_id, now)
+
         return count
+
+    def _ensure_dir_node(self, project_id: str, dir_path: str, now: str) -> str:
+        """Get-or-create a synthetic directory node (type spec). Shared by id
+        across every file under that directory."""
+        from pathlib import Path as _Path
+        node_id = hashlib.sha256(f"{project_id}specdir:{dir_path}".encode()).hexdigest()
+        res = self._conn.execute(
+            "MATCH (c:Chunk {id: $id}) RETURN count(*)", {"id": node_id}
+        )
+        if res.get_next()[0] == 0:
+            title = _Path(dir_path).name or dir_path
+            self._conn.execute(
+                """
+                CREATE (:Chunk {
+                    id: $id, project_id: $project_id, title: $title,
+                    content: $content, type: 'spec', importance: 3,
+                    status: 'active', source: $source, embedding: $embedding,
+                    created_at: $now, updated_at: $now, deleted_at: ''
+                })
+                """,
+                {
+                    "id":         node_id,
+                    "project_id": project_id,
+                    "title":      title,
+                    "content":    f"Spec directory: {dir_path}",
+                    "source":     dir_path,
+                    "embedding":  _embed(make_embedding_target("spec", title, "")),
+                    "now":        now,
+                },
+            )
+        return node_id
+
+    def _link_spec_dir_tree(self, project_id: str, file_path: str, file_root_id: str, now: str) -> None:
+        from pathlib import Path as _Path
+        parts = _Path(file_path).parent.parts
+        if not parts:
+            return  # file at spec-path root — its file root is the top
+        dir_ids: list[str] = []
+        cum = ""
+        for p in parts:
+            cum = f"{cum}/{p}" if cum else p
+            dir_ids.append(self._ensure_dir_node(project_id, cum, now))
+        for parent, child in zip(dir_ids, dir_ids[1:]):
+            self._add_edge(parent, child, "RELATES_TO", 0.6, "hierarchy")
+        self._add_edge(dir_ids[-1], file_root_id, "RELATES_TO", 0.6, "hierarchy")
 
     def clear_spec_chunks(self, project_id: str) -> None:
         try:

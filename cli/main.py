@@ -1304,6 +1304,7 @@ _EDGE_COLORS = {
     "RELATES_TO":   MUTED,
     "DERIVED_FROM": GREEN,
     "DEPENDS_ON":   ORANGE,
+    "CONTAINS":     MUTED,
 }
 
 _EDGE_LABELS = {
@@ -1312,7 +1313,15 @@ _EDGE_LABELS = {
     "RELATES_TO":   "RELATES TO",
     "DERIVED_FROM": "DERIVED FROM",
     "DEPENDS_ON":   "DEPENDS ON",
+    "CONTAINS":     "CONTAINS",
 }
+
+
+def _edge_group_key(e: dict) -> str:
+    """Spec-hierarchy RELATES_TO edges display as their own CONTAINS group."""
+    if e["edge_type"] == "RELATES_TO" and e.get("created_by") == "hierarchy":
+        return "CONTAINS"
+    return e["edge_type"]
 
 
 def _edge_str(edge_type: str, confidence: Optional[float], direction: str) -> str:
@@ -1417,7 +1426,7 @@ def graph(
         # Group edges by type for cleaner display
         by_type: dict[str, list] = {}
         for e in (edges or []):
-            by_type.setdefault(e["edge_type"], []).append(e)
+            by_type.setdefault(_edge_group_key(e), []).append(e)
 
         for et, group in sorted(by_type.items()):
             color = _EDGE_COLORS.get(et, MUTED)
@@ -1453,9 +1462,9 @@ def graph(
         # Group by edge type
         by_type: dict[str, list] = {}
         for e in edges:
-            by_type.setdefault(e["edge_type"], []).append(e)
+            by_type.setdefault(_edge_group_key(e), []).append(e)
 
-        for et in ["CONTRADICTS", "SUPERSEDES", "DEPENDS_ON", "RELATES_TO", "DERIVED_FROM"]:
+        for et in ["CONTRADICTS", "SUPERSEDES", "DEPENDS_ON", "RELATES_TO", "DERIVED_FROM", "CONTAINS"]:
             group = by_type.get(et, [])
             if not group:
                 continue
